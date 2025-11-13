@@ -106,3 +106,74 @@ Key features:
   
 ![Progetto senza titolo (1) (1)](https://github.com/user-attachments/assets/44635208-52d4-4780-ab61-9b2a3705ce11)
 ![Screenshot from 2024-07-23 16-27-00 (1)](https://github.com/user-attachments/assets/859a057a-56e8-41e3-ab53-13231e94e3cf)
+
+## Citing Omni3D <a name="citing"></a>
+
+Please cite the original Omni3D paper:
+
+```BibTeX
+@inproceedings{brazil2023omni3d,
+  author =       {Garrick Brazil and Abhinav Kumar and Julian Straub and Nikhila Ravi and Justin Johnson and Georgia Gkioxari},
+  title =        {{Omni3D}: A Large Benchmark and Model for {3D} Object Detection in the Wild},
+  booktitle =    {CVPR},
+  address =      {Vancouver, Canada},
+  month =        {June},
+  year =         {2023},
+  organization = {IEEE},
+}
+```
+
+---
+
+# Chat with Phi-3 Vision <a name="chatwithphi3vision"></a>
+
+![CHAT4](https://github.com/user-attachments/assets/68f3b64e-a070-49e6-b813-582354134085)
+
+
+This folder is part of the **Monocular 3D Object Detection and Tracking** project and contains a Streamlit-based application that allows users to interact with a vision model, specifically Phi-3 Vision, to analyze images and return detailed descriptions.
+
+## Overview
+
+The application is designed to:
+- Receive images from a server via a socket connection
+- Allow users to submit specific queries about the images
+- Leverage Phi-3 Vision to provide detailed descriptions of image content
+
+Key features:
+- **Real-time communication** with a server for image acquisition
+- **Text-based interaction** for specific image details
+- **Automatic frame fetching** upon query submission
+- **Customizable chat interface** that resets after each response
+- **Responsive design** for smooth user experience
+
+## Installation
+
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/ramonatarantino/mocular-3d-object-detection-tracking.git
+   cd mocular-3d-object-detection-tracking/chat-with-phi-3-vision
+   ```
+
+2. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+3. **Run the application:**
+   ```bash
+   streamlit run app.py
+   ```
+
+4. **Start the server:**
+   Ensure the server providing the image stream is running.
+
+## License (Chat with Phi 3 Vision) <a name="license"></a>
+
+This project is licensed under the MIT License.  
+The server code is based on the work from [this repository](https://github.com/bhimrazy/chat-with-phi-3-vision).
+
+## Contributing <a name="contributing"></a>
+
+Contributions are welcome! Feel free to open issues or submit pull requests.
+
+---
