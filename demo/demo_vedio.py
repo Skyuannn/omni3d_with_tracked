@@ -168,6 +168,27 @@ def match_detections(detections1, detections2):
     
     Returns:
         matches (list): List of matched indices between the two detection sets.
+    
+    Examples:
+        corners1 = [A1, A2]
+        corners2 = [B1, B2, B3]
+        cost_matrix = [[0.1, 0.5, 0.7],
+                       [0.6, 0.2, 0.9]]
+        第一行[0.1, 0.5, 0.7]:
+            A1与B1的成本是0.1
+            A1与B2的成本是0.5
+            A1与B3的成本是0.7
+        第二行[0.6, 0.2, 0.9]:
+            A2与B1的成本是0.6
+            A2与B2的成本是0.2   
+            A2与B3的成本是0.9
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)从cost_matrix中找到成本最小的方案
+        输出：
+            # A1匹配B1,A2匹配B2
+            row_ind = [0, 1]  # 行索引
+            col_ind = [0, 1]  # 列索引
+        for i, j in zip(row_ind, col_ind):
+            (i, j) = ((0, 0), (1, 1))
     """
     global consecutive_high_scores, consecutive_very_high_scores
 
@@ -234,7 +255,7 @@ def match_detections(detections1, detections2):
 
     return matches
 
-def update_tracks(tracks, matches, detections1, detections2, max_age=150):
+def update_tracks(tracks, lost_tracks, matches, detections1, detections2, max_age=150, max_lost_age=3000000000):
     """
     Updates track dictionary with matched detections, ages existing tracks,
     and adds new objects as tracks when no match is found.
@@ -251,6 +272,7 @@ def update_tracks(tracks, matches, detections1, detections2, max_age=150):
     """
     matched_indices = set()
     updated_tracks = {}
+    updated_lost_tracks = {}
 
     # Update matched tracks
     for i, j in matches:
@@ -260,22 +282,36 @@ def update_tracks(tracks, matches, detections1, detections2, max_age=150):
         updated_tracks[track_id]['age'] = 0  # Reset track age after a match
         matched_indices.add(j)
 
+        # 若匹配到lost_tracks,说明记录过的物体重新出现,移除lost_tracks中的记录
+        if track_id in lost_tracks:
+            del lost_tracks[track_id]
+
     # Age the tracks that were not updated
     for track_id, track in tracks.items():
         if track_id not in updated_tracks:
             track['age'] += 1
             if track['age'] < max_age:
                 updated_tracks[track_id] = track
+            else:
+                lost_tracks[track_id] = track  # Move to lost tracks
+    
+    # 更新 lost tracks
+    for track_id, track in lost_tracks.items():
+        track['age'] += 1
+        if track['age'] < max_lost_age:
+            updated_lost_tracks[track_id] = track
 
     # Add new objects as tracks
+    existing_ids = set(list(updated_tracks.keys()) + list(updated_lost_tracks.keys()))
     for idx, det in enumerate(detections2):
         if idx not in matched_indices:
             new_id = max(tracks.keys(), default=0) + 1
             det['track_id'] = new_id
             det['age'] = 0
             updated_tracks[new_id] = det
+            existing_ids.add(new_id)
 
-    return updated_tracks
+    return updated_tracks, updated_lost_tracks
 
 
 
@@ -344,6 +380,7 @@ def parse_detections(dets, thres, cats, target_cats):
 
 # Dictionary to store active tracks
 tracks = {}
+lost_tracks = {}
 
 def do_test(args, cfg, model):
 
@@ -383,9 +420,11 @@ def do_test(args, cfg, model):
     cats = metadata['thing_classes']
 
     # Tracking 初始化
-    global tracks
+    global tracks, lost_tracks
     tracks = {}
+    lost_tracks = {}
     max_track_age = 150
+    max_lost_age = 3000000000
     frame_number = 0
 
     print("启动实时检测与追踪 (按 'q' 退出)")
@@ -425,7 +464,6 @@ def do_test(args, cfg, model):
         # === 推理 ===
         with torch.no_grad():
             outputs = model(batched)[0]['instances']
-        n_outputs = len(outputs)
 
         # === 解析检测 ===
         detections = parse_detections(outputs, thres, cats, target_cats)
@@ -433,15 +471,17 @@ def do_test(args, cfg, model):
 
         if frame_number == 0:
             # 初始化tracks
+            tracks = {}
+            lost_tracks = {}
             for idx, detection in enumerate(detections):
                 detection['track_id'] = idx + 1
-                detection['age'] = 0
+                detection['age'] = 0    #目标存在帧数
                 tracks[idx + 1] = detection
         else:
             # 更新tracks
             current_detections = list(tracks.values())
             matches = match_detections(current_detections, detections)
-            tracks = update_tracks(tracks, matches, current_detections, detections, max_track_age)
+            tracks = update_tracks(tracks, lost_tracks, matches, current_detections, detections, max_track_age, max_lost_age)
 
         # === 绘制与输出 ===
         meshes, meshes_text, meshes2, meshes2_text = [], [], [], []
