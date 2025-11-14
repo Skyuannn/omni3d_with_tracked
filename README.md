@@ -13,11 +13,6 @@ This repository extends the Omni3D model by integrating a custom object tracking
 4. [Training](#training)
 5. [Inference](#inference)
 6. [Tracker Implementation](#tracker)
-7. [Chat with Phi 3 Vision](#chatwithphi3vision)
-8. [Citing Omni3D](#citing)
-9. [License](#license)
-10. [Contributing](#contributing)
-
 
 ## Overview <a name="overview"></a>
 

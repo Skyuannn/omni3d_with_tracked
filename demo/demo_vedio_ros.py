@@ -345,6 +345,155 @@ def parse_detections(dets, thres, cats, target_cats):
 # Dictionary to store active tracks
 tracks = {}
 
+
+def process_frame(frame, model, device, augmentations, focal_length, principal_point, thres, cats, target_cats, output_dir, display, frame_number):
+   
+    """
+    Processes a single frame for 3D object detection and tracking.
+
+    Args:
+        frame: The current image frame.
+        model: The 3D detection model.
+        device: The device to run the model on (e.g., 'cuda' or 'cpu').
+        augmentations: Augmentations to apply to the frame.
+        focal_length: The camera's focal length.
+        principal_point: The camera's principal point.
+        thres: Confidence threshold to consider detections valid.
+        cats: List of all possible object categories.
+        target_cats: Categories of interest for tracking.
+        output_dir: Directory to save the output images or results.
+        display: Boolean flag to display the frame with detections.
+        frame_number: Current frame number in the video sequence.
+
+    Returns:
+        A dictionary containing detections and associated metadata.
+    """
+    
+    h, w = frame.shape[:2]
+    if focal_length == 0:
+        focal_length = 4.0 * h / 2  # Default focal length NDC multiplied by image height
+    if len(principal_point) == 0:
+        px, py = w / 2, h / 2
+    else:
+        px, py = principal_point
+
+    K = np.array([
+        [focal_length, 0.0, px],
+        [0.0, focal_length, py],
+        [0.0, 0.0, 1.0]
+    ])
+
+    # Image preprocessing
+    aug_input = T.AugInput(frame)
+    _ = augmentations(aug_input)
+    image = aug_input.image
+    batched = [{
+        'image': torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1))).to(device),
+        'height': h, 'width': w, 'K': K
+    }]
+
+    # Model prediction
+    with torch.no_grad():
+        outputs = model(batched)[0]['instances']
+
+    
+
+    global tracks 
+    max_track_age = 150
+
+    detections = parse_detections(outputs, thres, cats, target_cats)
+    print("DETECTIONS originali : ")
+    print(detections)
+
+
+    detections = remove_lowest_score_detection(detections)
+    print("DETECTIONS con eliminazioni : ")
+    print(detections)
+
+    
+
+    if frame_number == 0:
+        # Inizializza i tracciati con le prime detezioni
+        for idx, detection in enumerate(detections):
+            detection['track_id'] = idx + 1
+            detection['age'] = 0 
+            tracks[idx + 1] = detection
+    else:
+        # Aggiorna i tracciati esistenti con nuove detezioni
+        current_detections = list(tracks.values())
+        matches = match_detections(current_detections, detections)
+        tracks = update_tracks(tracks, matches, current_detections, detections, max_track_age)
+    
+    # Stampa i risultati del tracking per il frame corrente
+    meshes_text = []
+    meshes = []
+    meshes2 = []
+    meshes2_text = []
+
+    print(f'Frame {frame_number}:')
+    for track_id, track in tracks.items():
+        #if track['age'] < max_track_age and track['category'] in target_cats: 
+        if track['age'] < max_track_age:
+            print(f"Track ID: {track_id}, Category: {track['category']}, Score: {track['score']:.2f}, age: {track['age']}")
+            cat = track['category']
+            score = track['score']
+            meshes_text.append(f"T-ID: {track_id}, Cat: {cat}, Scr: {score:.2f}")
+
+            bbox = track['bbox3D'] 
+            pose = track['pose']
+            color = [c / 255.0 for c in get_unique_color(track_id)]
+
+            box_mesh = util.mesh_cuboid(bbox, pose.tolist(), color=color)
+            meshes.append(box_mesh)
+
+    # Rappresenta tutte le detection
+    for idx, (corners3D2, center_cam2, center_2D2, dimensions2, pose2, score2, cat_idx2) in enumerate(zip(
+                outputs.pred_bbox3D, outputs.pred_center_cam, outputs.pred_center_2D, outputs.pred_dimensions,
+                outputs.pred_pose, outputs.scores, outputs.pred_classes
+        )):
+        
+        if score2 < thres:
+            continue
+
+        cat2 = cats[cat_idx2]
+        # if cat2 not in target_cats and len(target_cats) > 0:
+        #     continue
+
+        bbox3D2 = center_cam2.tolist() + dimensions2.tolist()
+        meshes2_text.append(f"Cat: {cat2}, Scr: {score2:.2f}")
+
+        # Cerca l'oggetto nelle tracce esistenti per mantenere il colore
+        matched_track_id = None
+        for track_id, track in tracks.items():
+            if np.allclose(track['corners3D'], corners3D2.cpu().numpy(), atol=1e-2):
+                matched_track_id = track_id
+                break
+        
+        if matched_track_id is not None:
+            color = [c / 255.0 for c in get_unique_color(matched_track_id)]
+        else:
+            color = [c / 255.0 for c in util.get_color(idx)]
+        
+        box_mesh2 = util.mesh_cuboid(bbox3D2, pose2.tolist(), color=color)
+        meshes2.append(box_mesh2)
+
+    # Rendering e salvataggio delle immagini
+    if len(meshes) > 0 or len(meshes2) > 0:
+        if len(meshes) > 0:
+            _, im_topdown, _ = vis.draw_scene_view(frame, K, meshes, text=meshes_text, scale=frame.shape[0], blend_weight=0.5, blend_weight_overlay=0.85)
+            util.imwrite(im_topdown, os.path.join(output_dir, f'frame_{frame_number:06d}_novel.jpg'))
+        
+        if len(meshes2) > 0:
+            im_drawn_rgb, _, _ = vis.draw_scene_view(frame, K, meshes2, text=meshes2_text, scale=frame.shape[0], blend_weight=0.5, blend_weight_overlay=0.85)
+            util.imwrite(im_drawn_rgb, os.path.join(output_dir, f'frame_{frame_number:06d}_boxes.jpg'))
+        
+        if display:
+            im_concat = np.concatenate((im_topdown if len(meshes) > 0 else np.zeros_like(im_drawn_rgb), im_drawn_rgb if len(meshes2) > 0 else np.zeros_like(im_topdown)), axis=1)
+            vis.imshow(im_concat)
+    else:
+        util.imwrite(frame, os.path.join(output_dir, f'frame_{frame_number:06d}_boxes.jpg'))
+
+
 def do_test(args, cfg, model):
 
     """
