@@ -67,6 +67,13 @@ python demo/demo_tracker.py \
 --threshold 0.40 --display 
 ```
 
+```bash
+# Run the demo with the realtime tarcker
+python demo/demo_vedio.py \
+--config-file cubercnn://omni3d/cubercnn_DLA34_FPN.yaml \
+MODEL.WEIGHTS cubercnn://omni3d/cubercnn_DLA34_FPN.pth
+```
+
 ## Training <a name="training"></a>
 
 To train the Omni3D model with tracking:

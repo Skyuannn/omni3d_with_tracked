@@ -274,42 +274,56 @@ def update_tracks(tracks, lost_tracks, matches, detections1, detections2, max_ag
     updated_tracks = {}
     updated_lost_tracks = {}
 
-    # Update matched tracks
+    # 1. 处理已匹配的 tracks —— 直接更新
     for i, j in matches:
         track_id = detections1[i]['track_id']
-        detections2[j]['track_id'] = track_id
-        updated_tracks[track_id] = detections2[j]
-        updated_tracks[track_id]['age'] = 0  # Reset track age after a match
+
+        new_det = detections2[j].copy()
+        new_det['track_id'] = track_id
+        new_det['age'] = 0  # reset age after match
+
+        updated_tracks[track_id] = new_det
         matched_indices.add(j)
 
-        # 若匹配到lost_tracks,说明记录过的物体重新出现,移除lost_tracks中的记录
-        if track_id in lost_tracks:
-            del lost_tracks[track_id]
-
-    # Age the tracks that were not updated
+    # 2. 更新未匹配的 active tracks —— 增加 age
     for track_id, track in tracks.items():
-        if track_id not in updated_tracks:
-            track['age'] += 1
-            if track['age'] < max_age:
-                updated_tracks[track_id] = track
+        if track_id not in updated_tracks:   # 未匹配
+            t = track.copy()
+            t['age'] += 1
+            if t['age'] < max_age:
+                updated_tracks[track_id] = t  # 仍保留在 active
             else:
-                lost_tracks[track_id] = track  # Move to lost tracks
-    
-    # 更新 lost tracks
-    for track_id, track in lost_tracks.items():
-        track['age'] += 1
-        if track['age'] < max_lost_age:
-            updated_lost_tracks[track_id] = track
+                # 超过 age → 放入 lost_tracks
+                lost_tracks[track_id] = t
 
-    # Add new objects as tracks
-    existing_ids = set(list(updated_tracks.keys()) + list(updated_lost_tracks.keys()))
+    # 3. 更新 lost_tracks —— age 增加并过滤过期 ID
+    for track_id, track in lost_tracks.items():
+        # 若已在 updated_tracks 中重新出现，则跳过
+        if track_id in updated_tracks:
+            continue
+
+        t = track.copy()
+        t['age'] += 1
+        if t['age'] < max_lost_age:
+            updated_lost_tracks[track_id] = t  # 仍保留在 lost
+    
+    # 4. 为新出现的物体赋予新的 track_id
+    used_ids = (
+        set(updated_tracks.keys()) |
+        set(updated_lost_tracks.keys()) |
+        set(tracks.keys()) |
+        set(lost_tracks.keys())
+    )
+    next_id = max(used_ids) + 1 if used_ids else 1
+
     for idx, det in enumerate(detections2):
         if idx not in matched_indices:
-            new_id = max(tracks.keys(), default=0) + 1
-            det['track_id'] = new_id
-            det['age'] = 0
-            updated_tracks[new_id] = det
-            existing_ids.add(new_id)
+            new_det = det.copy()
+            new_det['track_id'] = next_id
+            new_det['age'] = 0
+
+            updated_tracks[next_id] = new_det
+            next_id += 1
 
     return updated_tracks, updated_lost_tracks
 
@@ -471,8 +485,6 @@ def do_test(args, cfg, model):
 
         if frame_number == 0:
             # 初始化tracks
-            tracks = {}
-            lost_tracks = {}
             for idx, detection in enumerate(detections):
                 detection['track_id'] = idx + 1
                 detection['age'] = 0    #目标存在帧数
@@ -480,8 +492,10 @@ def do_test(args, cfg, model):
         else:
             # 更新tracks
             current_detections = list(tracks.values())
-            matches = match_detections(current_detections, detections)
-            tracks = update_tracks(tracks, lost_tracks, matches, current_detections, detections, max_track_age, max_lost_age)
+            current_lost_list =  list(lost_tracks.values())
+            candidates = current_detections + current_lost_list
+            matches = match_detections(candidates, detections)
+            tracks, lost_tracks = update_tracks(tracks, lost_tracks, matches, candidates, detections, max_track_age, max_lost_age)
 
         # === 绘制与输出 ===
         meshes, meshes_text, meshes2, meshes2_text = [], [], [], []
