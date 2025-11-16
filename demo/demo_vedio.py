@@ -270,9 +270,10 @@ def update_tracks(tracks, lost_tracks, matches, detections1, detections2, max_ag
     Returns:
         updated_tracks (dict): Updated dictionary of tracks.
     """
-    matched_indices = set()
+    tracks = {k: v.copy() for k, v in tracks.items()}
+    updated_lost = {k: v.copy() for k, v in lost_tracks.items()}
     updated_tracks = {}
-    updated_lost_tracks = {}
+    matched_indices = set()
 
     # 1. 处理已匹配的 tracks —— 直接更新
     for i, j in matches:
@@ -285,35 +286,23 @@ def update_tracks(tracks, lost_tracks, matches, detections1, detections2, max_ag
         updated_tracks[track_id] = new_det
         matched_indices.add(j)
 
+        if track_id in updated_lost:
+            del updated_lost[track_id]
+
     # 2. 更新未匹配的 active tracks —— 增加 age
     for track_id, track in tracks.items():
-        if track_id not in updated_tracks:   # 未匹配
-            t = track.copy()
-            t['age'] += 1
-            if t['age'] < max_age:
-                updated_tracks[track_id] = t  # 仍保留在 active
-            else:
-                # 超过 age → 放入 lost_tracks
-                lost_tracks[track_id] = t
-
-    # 3. 更新 lost_tracks —— age 增加并过滤过期 ID
-    for track_id, track in lost_tracks.items():
-        # 若已在 updated_tracks 中重新出现，则跳过
-        if track_id in updated_tracks:
-            continue
+        if track_id in updated_tracks:   
+            continue  # 已匹配，跳过
 
         t = track.copy()
-        t['age'] += 1
-        if t['age'] < max_lost_age:
-            updated_lost_tracks[track_id] = t  # 仍保留在 lost
-    
-    # 4. 为新出现的物体赋予新的 track_id
-    used_ids = (
-        set(updated_tracks.keys()) |
-        set(updated_lost_tracks.keys()) |
-        set(tracks.keys()) |
-        set(lost_tracks.keys())
-    )
+        t['age'] = t.get('age', 0) + 1
+        if t['age'] < max_age:
+            updated_tracks[track_id] = t  # 仍保留在 active tracks
+        else:
+            updated_lost[track_id] = t  # 移动到 lost tracks
+
+    # 3. 更新 lost_tracks —— age 增加并过滤过期 ID
+    used_ids = set(updated_tracks.keys()) | set(updated_lost.keys()) | set(tracks.keys()) | set(lost_tracks.keys())
     next_id = max(used_ids) + 1 if used_ids else 1
 
     for idx, det in enumerate(detections2):
@@ -321,11 +310,10 @@ def update_tracks(tracks, lost_tracks, matches, detections1, detections2, max_ag
             new_det = det.copy()
             new_det['track_id'] = next_id
             new_det['age'] = 0
-
             updated_tracks[next_id] = new_det
             next_id += 1
 
-    return updated_tracks, updated_lost_tracks
+    return updated_tracks, updated_lost
 
 
 
@@ -416,7 +404,7 @@ def do_test(args, cfg, model):
     principal_point = args.principal_point
     thres = args.threshold
     # target_cats = args.target_cats if hasattr(args, 'target_cats') else []
-    target_cats = ['chair', 'door']  
+    target_cats = ['cup', 'door']  
     output_dir = args.output_dir if hasattr(args, 'output_dir') else "./output"
     os.makedirs(output_dir, exist_ok=True)
     display = getattr(args, 'display', True)
@@ -437,7 +425,7 @@ def do_test(args, cfg, model):
     global tracks, lost_tracks
     tracks = {}
     lost_tracks = {}
-    max_track_age = 150
+    max_track_age = 50
     max_lost_age = 3000000000
     frame_number = 0
 
@@ -510,6 +498,15 @@ def do_test(args, cfg, model):
                 color = [c / 255.0 for c in get_unique_color(track_id)]
                 box_mesh = util.mesh_cuboid(bbox, pose.tolist(), color=color)
                 meshes.append(box_mesh)
+        for track_id, track in lost_tracks.items():
+            cat = track['category']
+            score = track['score']
+            bbox = track['bbox3D']
+            pose = track['pose']
+            color = [0.5, 0.5, 0.5]  # 灰色表示丢失的目标
+            meshes_text.append(f"L-ID: {track_id}, Category: {cat}, Scr: {score:.2f}")
+            box_mesh = util.mesh_cuboid(bbox, pose.tolist(), color=color)
+            meshes.append(box_mesh)
 
         # 原始检测绘制
         for idx, (corners3D2, center_cam2, center_2D2, dimensions2, pose2, score2, cat_idx2) in enumerate(zip(
