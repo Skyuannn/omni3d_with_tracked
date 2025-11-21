@@ -168,6 +168,27 @@ def match_detections(detections1, detections2):
     
     Returns:
         matches (list): List of matched indices between the two detection sets.
+    
+    Examples:
+        corners1 = [A1, A2]
+        corners2 = [B1, B2, B3]
+        cost_matrix = [[0.1, 0.5, 0.7],
+                       [0.6, 0.2, 0.9]]
+        第一行[0.1, 0.5, 0.7]:
+            A1与B1的成本是0.1
+            A1与B2的成本是0.5
+            A1与B3的成本是0.7
+        第二行[0.6, 0.2, 0.9]:
+            A2与B1的成本是0.6
+            A2与B2的成本是0.2   
+            A2与B3的成本是0.9
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)从cost_matrix中找到成本最小的方案
+        输出：
+            # A1匹配B1,A2匹配B2
+            row_ind = [0, 1]  # 行索引
+            col_ind = [0, 1]  # 列索引
+        for i, j in zip(row_ind, col_ind):
+            (i, j) = ((0, 0), (1, 1))
     """
     global consecutive_high_scores, consecutive_very_high_scores
 
@@ -234,7 +255,7 @@ def match_detections(detections1, detections2):
 
     return matches
 
-def update_tracks(tracks, matches, detections1, detections2, max_age=150):
+def update_tracks(tracks, lost_tracks, matches, detections1, detections2, max_age=150):
     """
     Updates track dictionary with matched detections, ages existing tracks,
     and adds new objects as tracks when no match is found.
@@ -251,6 +272,7 @@ def update_tracks(tracks, matches, detections1, detections2, max_age=150):
     """
     matched_indices = set()
     updated_tracks = {}
+    updated_lost_tracks = {k: v.copy() for k, v in lost_tracks.items()}  # 深拷贝继承 lost_tracks
 
     # Update matched tracks
     for i, j in matches:
@@ -260,22 +282,30 @@ def update_tracks(tracks, matches, detections1, detections2, max_age=150):
         updated_tracks[track_id]['age'] = 0  # Reset track age after a match
         matched_indices.add(j)
 
+        # 从 lost_tracks 中恢复（如果之前丢过）
+        updated_lost_tracks.pop(track_id, None)
+
     # Age the tracks that were not updated
     for track_id, track in tracks.items():
         if track_id not in updated_tracks:
             track['age'] += 1
             if track['age'] < max_age:
                 updated_tracks[track_id] = track
+            else:
+                updated_lost_tracks[track_id] = track  # Move to lost tracks
+    
 
     # Add new objects as tracks
+    existing_ids = set(list(updated_tracks.keys()) + list(updated_lost_tracks.keys()))
     for idx, det in enumerate(detections2):
         if idx not in matched_indices:
             new_id = max(tracks.keys(), default=0) + 1
             det['track_id'] = new_id
             det['age'] = 0
             updated_tracks[new_id] = det
+            existing_ids.add(new_id)
 
-    return updated_tracks
+    return updated_tracks, updated_lost_tracks
 
 
 
@@ -344,155 +374,7 @@ def parse_detections(dets, thres, cats, target_cats):
 
 # Dictionary to store active tracks
 tracks = {}
-
-
-def process_frame(frame, model, device, augmentations, focal_length, principal_point, thres, cats, target_cats, output_dir, display, frame_number):
-   
-    """
-    Processes a single frame for 3D object detection and tracking.
-
-    Args:
-        frame: The current image frame.
-        model: The 3D detection model.
-        device: The device to run the model on (e.g., 'cuda' or 'cpu').
-        augmentations: Augmentations to apply to the frame.
-        focal_length: The camera's focal length.
-        principal_point: The camera's principal point.
-        thres: Confidence threshold to consider detections valid.
-        cats: List of all possible object categories.
-        target_cats: Categories of interest for tracking.
-        output_dir: Directory to save the output images or results.
-        display: Boolean flag to display the frame with detections.
-        frame_number: Current frame number in the video sequence.
-
-    Returns:
-        A dictionary containing detections and associated metadata.
-    """
-    
-    h, w = frame.shape[:2]
-    if focal_length == 0:
-        focal_length = 4.0 * h / 2  # Default focal length NDC multiplied by image height
-    if len(principal_point) == 0:
-        px, py = w / 2, h / 2
-    else:
-        px, py = principal_point
-
-    K = np.array([
-        [focal_length, 0.0, px],
-        [0.0, focal_length, py],
-        [0.0, 0.0, 1.0]
-    ])
-
-    # Image preprocessing
-    aug_input = T.AugInput(frame)
-    _ = augmentations(aug_input)
-    image = aug_input.image
-    batched = [{
-        'image': torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1))).to(device),
-        'height': h, 'width': w, 'K': K
-    }]
-
-    # Model prediction
-    with torch.no_grad():
-        outputs = model(batched)[0]['instances']
-
-    
-
-    global tracks 
-    max_track_age = 150
-
-    detections = parse_detections(outputs, thres, cats, target_cats)
-    print("DETECTIONS originali : ")
-    print(detections)
-
-
-    detections = remove_lowest_score_detection(detections)
-    print("DETECTIONS con eliminazioni : ")
-    print(detections)
-
-    
-
-    if frame_number == 0:
-        # Inizializza i tracciati con le prime detezioni
-        for idx, detection in enumerate(detections):
-            detection['track_id'] = idx + 1
-            detection['age'] = 0 
-            tracks[idx + 1] = detection
-    else:
-        # Aggiorna i tracciati esistenti con nuove detezioni
-        current_detections = list(tracks.values())
-        matches = match_detections(current_detections, detections)
-        tracks = update_tracks(tracks, matches, current_detections, detections, max_track_age)
-    
-    # Stampa i risultati del tracking per il frame corrente
-    meshes_text = []
-    meshes = []
-    meshes2 = []
-    meshes2_text = []
-
-    print(f'Frame {frame_number}:')
-    for track_id, track in tracks.items():
-        #if track['age'] < max_track_age and track['category'] in target_cats: 
-        if track['age'] < max_track_age:
-            print(f"Track ID: {track_id}, Category: {track['category']}, Score: {track['score']:.2f}, age: {track['age']}")
-            cat = track['category']
-            score = track['score']
-            meshes_text.append(f"T-ID: {track_id}, Cat: {cat}, Scr: {score:.2f}")
-
-            bbox = track['bbox3D'] 
-            pose = track['pose']
-            color = [c / 255.0 for c in get_unique_color(track_id)]
-
-            box_mesh = util.mesh_cuboid(bbox, pose.tolist(), color=color)
-            meshes.append(box_mesh)
-
-    # Rappresenta tutte le detection
-    for idx, (corners3D2, center_cam2, center_2D2, dimensions2, pose2, score2, cat_idx2) in enumerate(zip(
-                outputs.pred_bbox3D, outputs.pred_center_cam, outputs.pred_center_2D, outputs.pred_dimensions,
-                outputs.pred_pose, outputs.scores, outputs.pred_classes
-        )):
-        
-        if score2 < thres:
-            continue
-
-        cat2 = cats[cat_idx2]
-        # if cat2 not in target_cats and len(target_cats) > 0:
-        #     continue
-
-        bbox3D2 = center_cam2.tolist() + dimensions2.tolist()
-        meshes2_text.append(f"Cat: {cat2}, Scr: {score2:.2f}")
-
-        # Cerca l'oggetto nelle tracce esistenti per mantenere il colore
-        matched_track_id = None
-        for track_id, track in tracks.items():
-            if np.allclose(track['corners3D'], corners3D2.cpu().numpy(), atol=1e-2):
-                matched_track_id = track_id
-                break
-        
-        if matched_track_id is not None:
-            color = [c / 255.0 for c in get_unique_color(matched_track_id)]
-        else:
-            color = [c / 255.0 for c in util.get_color(idx)]
-        
-        box_mesh2 = util.mesh_cuboid(bbox3D2, pose2.tolist(), color=color)
-        meshes2.append(box_mesh2)
-
-    # Rendering e salvataggio delle immagini
-    if len(meshes) > 0 or len(meshes2) > 0:
-        if len(meshes) > 0:
-            _, im_topdown, _ = vis.draw_scene_view(frame, K, meshes, text=meshes_text, scale=frame.shape[0], blend_weight=0.5, blend_weight_overlay=0.85)
-            util.imwrite(im_topdown, os.path.join(output_dir, f'frame_{frame_number:06d}_novel.jpg'))
-        
-        if len(meshes2) > 0:
-            im_drawn_rgb, _, _ = vis.draw_scene_view(frame, K, meshes2, text=meshes2_text, scale=frame.shape[0], blend_weight=0.5, blend_weight_overlay=0.85)
-            util.imwrite(im_drawn_rgb, os.path.join(output_dir, f'frame_{frame_number:06d}_boxes.jpg'))
-        
-        if display:
-            im_concat = np.concatenate((im_topdown if len(meshes) > 0 else np.zeros_like(im_drawn_rgb), im_drawn_rgb if len(meshes2) > 0 else np.zeros_like(im_topdown)), axis=1)
-            vis.imshow(im_concat)
-    else:
-        util.imwrite(frame, os.path.join(output_dir, f'frame_{frame_number:06d}_boxes.jpg'))
-
+lost_tracks = {}
 
 def do_test(args, cfg, model):
 
@@ -532,9 +414,10 @@ def do_test(args, cfg, model):
     cats = metadata['thing_classes']
 
     # Tracking 初始化
-    global tracks
+    global tracks, lost_tracks
     tracks = {}
-    max_track_age = 150
+    lost_tracks = {}
+    max_track_age = 50
     frame_number = 0
 
     print("启动实时检测与追踪 (按 'q' 退出)")
@@ -574,23 +457,24 @@ def do_test(args, cfg, model):
         # === 推理 ===
         with torch.no_grad():
             outputs = model(batched)[0]['instances']
-        n_outputs = len(outputs)
 
         # === 解析检测 ===
         detections = parse_detections(outputs, thres, cats, target_cats)
-        detections = remove_lowest_score_detection(detections)
+        # detections = remove_lowest_score_detection(detections)
 
         if frame_number == 0:
             # 初始化tracks
+            tracks = {}
+            updated_lost_tracks = {}
             for idx, detection in enumerate(detections):
                 detection['track_id'] = idx + 1
-                detection['age'] = 0
+                detection['age'] = 0    #目标存在帧数
                 tracks[idx + 1] = detection
         else:
             # 更新tracks
             current_detections = list(tracks.values())
             matches = match_detections(current_detections, detections)
-            tracks = update_tracks(tracks, matches, current_detections, detections, max_track_age)
+            tracks, lost_tracks = update_tracks(tracks, lost_tracks, matches, current_detections, detections, max_track_age)
 
         # === 绘制与输出 ===
         meshes, meshes_text, meshes2, meshes2_text = [], [], [], []
@@ -605,6 +489,15 @@ def do_test(args, cfg, model):
                 color = [c / 255.0 for c in get_unique_color(track_id)]
                 box_mesh = util.mesh_cuboid(bbox, pose.tolist(), color=color)
                 meshes.append(box_mesh)
+        for lost_track_id, lost_track in lost_tracks.items():
+            cat = lost_track['category']
+            score = lost_track['score']
+            bbox = lost_track['bbox3D']
+            pose = lost_track['pose']
+            color = [0.5, 0.5, 0.5]  # 灰色表示丢失的目标
+            meshes_text.append(f"L-ID: {lost_track_id}, Category: {cat}, Scr: {score:.2f}")
+            box_mesh = util.mesh_cuboid(bbox, pose.tolist(), color=color)
+            meshes.append(box_mesh)
 
         # 原始检测绘制
         for idx, (corners3D2, center_cam2, center_2D2, dimensions2, pose2, score2, cat_idx2) in enumerate(zip(
@@ -767,6 +660,3 @@ if __name__ == "__main__":
         dist_url=args.dist_url,
         args=(args,),
     )
-
-
-
