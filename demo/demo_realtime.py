@@ -348,37 +348,36 @@ def parse_detections(dets, thres, cats, target_cats):
         parsed_detections (list): List of parsed and filtered detections.
     """
     parsed_detections = []
-    n_det = len(dets)
-    if n_det > 0:
-        # Iterate over each detection and its corresponding properties
-        for idx, (corners3D, center_cam, dimensions, score, cat_idx, pose, scores_full) in enumerate(
-                zip(dets.pred_bbox3D, dets.pred_center_cam, dets.pred_dimensions, dets.scores, 
-                    dets.pred_classes, dets.pred_pose, dets.scores_full)):
-            
-            # Skip detections with scores below the threshold
-            if score < thres:
-                continue
-            
-            # Get the category of the detection using the predicted class index
-            category = cats[cat_idx]
-            
-            # Optionally filter detections by target categories (currently commented out)
-            if target_cats and category not in target_cats:
-                continue
-            
-            # Create a detection dictionary with relevant properties
-            detection = {
-                'corners3D': corners3D.cpu().numpy(),  # Convert 3D corners tensor to numpy array
-                'pose': pose,  # Pose of the detected object
-                'bbox3D': center_cam.tolist() + dimensions.tolist(),  # 3D bounding box center and dimensions
-                'score': score,  # Detection score
-                'category': category,  # Object category
-                'track_id': None,  # Track ID initially set to None
-                'scores_full': scores_full  # Full score information
-            }
-            
-            # Add the detection to the parsed detections list
-            parsed_detections.append(detection)
+
+    # Iterate over each detection and its corresponding properties
+    for idx, (corners3D, center_cam, dimensions, score, cat_idx, pose, scores_full) in enumerate(
+            zip(dets.pred_bbox3D, dets.pred_center_cam, dets.pred_dimensions, dets.scores, 
+                dets.pred_classes, dets.pred_pose, dets.scores_full)):
+        
+        # Skip detections with scores below the threshold
+        if score < thres:
+            continue
+        
+        # Get the category of the detection using the predicted class index
+        category = cats[cat_idx]
+        
+        # Optionally filter detections by target categories (currently commented out)
+        if target_cats and category not in target_cats:
+            continue
+        
+        # Create a detection dictionary with relevant properties
+        detection = {
+            'corners3D': corners3D.cpu().numpy(),  # Convert 3D corners tensor to numpy array
+            'pose': pose,  # Pose of the detected object
+            'bbox3D': center_cam.tolist() + dimensions.tolist(),  # 3D bounding box center and dimensions
+            'score': score,  # Detection score
+            'category': category,  # Object category
+            'track_id': None,  # Track ID initially set to None
+            'scores_full': scores_full  # Full score information
+        }
+        
+        # Add the detection to the parsed detections list
+        parsed_detections.append(detection)
 
     return parsed_detections
 
@@ -390,21 +389,14 @@ lost_tracks = {}
 
 def do_test(args, cfg, model):
 
-    # 视频路径
-    video_path = args.input_video
-    cap = cv2.VideoCapture(video_path)
+    """
+    实时摄像头输入 + CubeRCNN 3D检测 + 物体追踪 + 绘制 + 保存
+    """
+
+    # 打开摄像头
+    cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        raise RuntimeError(f"无法打开视频文件: {video_path}")
-    
-    # 可选：保存输出视频
-    save_video = getattr(args, 'save_video', False)
-    if save_video:
-        output_video_path = os.path.join(args.output_dir, "tracked_output.mp4")
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        fps_out = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        frame_size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))*2, int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-        out_writer = cv2.VideoWriter(output_video_path, fourcc, fps_out, frame_size)
-        print(f"将保存追踪结果到: {output_video_path}")
+        raise RuntimeError("无法打开摄像头")
 
     # 模型准备
     model.eval()
@@ -477,11 +469,10 @@ def do_test(args, cfg, model):
         # === 推理 ===
         with torch.no_grad():
             outputs = model(batched)[0]['instances']
-        n_det = len(outputs)
 
         # === 解析检测 ===
         detections = parse_detections(outputs, thres, cats, target_cats)
-        # detections = remove_lowest_score_detection(detections)
+        detections = remove_lowest_score_detection(detections)
 
         if frame_number == 0:
             # 初始化tracks
@@ -510,35 +501,34 @@ def do_test(args, cfg, model):
                 color = [c / 255.0 for c in get_unique_color(track_id)]
                 box_mesh = util.mesh_cuboid(bbox, pose.tolist(), color=color)
                 meshes.append(box_mesh)
+                print (f"物体: {cat} 的位姿: {bbox}")
 
-        if n_det > 0:
-            # 原始检测绘制
-            for idx, (corners3D2, center_cam2, center_2D2, dimensions2, pose2, score2, cat_idx2) in enumerate(zip(
-                    outputs.pred_bbox3D, outputs.pred_center_cam, outputs.pred_center_2D, outputs.pred_dimensions,
-                    outputs.pred_pose, outputs.scores, outputs.pred_classes
-            )): 
-                if score2 < thres:
-                    continue
-                cat2 = cats[cat_idx2]
-                if cat2 not in target_cats and len(target_cats) > 0:
-                    continue
-                bbox3D2 = center_cam2.tolist() + dimensions2.tolist()
-                meshes2_text.append(f"Category: {cat2}, Scr: {score2:.2f}")
+        # 原始检测绘制
+        for idx, (corners3D2, center_cam2, center_2D2, dimensions2, pose2, score2, cat_idx2) in enumerate(zip(
+                outputs.pred_bbox3D, outputs.pred_center_cam, outputs.pred_center_2D, outputs.pred_dimensions,
+                outputs.pred_pose, outputs.scores, outputs.pred_classes
+        )): 
+            if score2 < thres:
+                continue
+            cat2 = cats[cat_idx2]
+            if cat2 not in target_cats and len(target_cats) > 0:
+                continue
+            bbox3D2 = center_cam2.tolist() + dimensions2.tolist()
+            meshes2_text.append(f"Category: {cat2}, Scr: {score2:.2f}")
 
-                matched_track_id = None
-                for track_id, track in tracks.items():
-                    if np.allclose(track['corners3D'], corners3D2.cpu().numpy(), atol=1e-2):
-                        matched_track_id = track_id
-                        break
+            matched_track_id = None
+            for track_id, track in tracks.items():
+                if np.allclose(track['corners3D'], corners3D2.cpu().numpy(), atol=1e-2):
+                    matched_track_id = track_id
+                    break
 
-                if matched_track_id is not None:
-                    color = [c / 255.0 for c in get_unique_color(matched_track_id)]
-                else:
-                    color = [c / 255.0 for c in util.get_color(idx)]
+            if matched_track_id is not None:
+                color = [c / 255.0 for c in get_unique_color(matched_track_id)]
+            else:
+                color = [c / 255.0 for c in util.get_color(idx)]
 
-                box_mesh2 = util.mesh_cuboid(bbox3D2, pose2.tolist(), color=color)
-                meshes2.append(box_mesh2)
-                print (f"物体: {cat2} 的位姿: {center_cam2.tolist() + dimensions2.tolist()}")
+            box_mesh2 = util.mesh_cuboid(bbox3D2, pose2.tolist(), color=color)
+            meshes2.append(box_mesh2)
 
         # === 可视化 ===
         im_drawn_rgb = im.copy()
@@ -633,11 +623,10 @@ if __name__ == "__main__":
         epilog=None, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--config-file", default="", metavar="FILE", help="path to config file")
-    parser.add_argument('--input-video', type=str, help='path to input video', required=True)
-    parser.add_argument('--save-video', action='store_true', help='是否把带追踪结果的画面保存为视频')
+    # parser.add_argument('--input-video', type=str, help='path to input video', required=True)
     parser.add_argument("--focal-length", type=float, default=0, help="focal length for image inputs (in px)")
     parser.add_argument("--principal-point", type=float, default=[], nargs=2, help="principal point for image inputs (in px)")
-    parser.add_argument("--threshold", type=float, default=0.30, help="threshold on score for visualizing")
+    parser.add_argument("--threshold", type=float, default=0.40, help="threshold on score for visualizing")
     parser.add_argument("--display", default=False, action="store_true", help="Whether to show the images in matplotlib",)
     parser.add_argument("--categories", nargs='*', default= [] , help="List of target categories to detect and track")
 
