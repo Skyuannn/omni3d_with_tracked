@@ -260,7 +260,7 @@ def match_detections(detections1, detections2):
 
     return matches
 
-def update_tracks(tracks, lost_tracks, matches, detections1, detections2, max_age=150, max_lost_age=3000000000):
+def update_tracks(tracks, lost_tracks, matches, detections1, detections2, max_age=150):
     """
     Updates track dictionary with matched detections, ages existing tracks,
     and adds new objects as tracks when no match is found.
@@ -287,10 +287,6 @@ def update_tracks(tracks, lost_tracks, matches, detections1, detections2, max_ag
         updated_tracks[track_id]['age'] = 0  # Reset track age after a match
         matched_indices.add(j)
 
-        # 若匹配到lost_tracks,说明记录过的物体重新出现,移除lost_tracks中的记录
-        if track_id in lost_tracks:
-            del lost_tracks[track_id]
-
     # Age the tracks that were not updated
     for track_id, track in tracks.items():
         if track_id not in updated_tracks:
@@ -298,13 +294,7 @@ def update_tracks(tracks, lost_tracks, matches, detections1, detections2, max_ag
             if track['age'] < max_age:
                 updated_tracks[track_id] = track
             else:
-                lost_tracks[track_id] = track  # Move to lost tracks
-    
-    # 更新 lost tracks
-    for track_id, track in lost_tracks.items():
-        track['age'] += 1
-        if track['age'] < max_lost_age:
-            updated_lost_tracks[track_id] = track
+                updated_lost_tracks[track_id] = track  # Move to lost tracks
 
     # Add new objects as tracks
     existing_ids = set(list(updated_tracks.keys()) + list(updated_lost_tracks.keys()))
@@ -317,7 +307,6 @@ def update_tracks(tracks, lost_tracks, matches, detections1, detections2, max_ag
             existing_ids.add(new_id)
 
     return updated_tracks, updated_lost_tracks
-
 
 
 def get_unique_color(track_id):
@@ -436,8 +425,7 @@ def do_test(args, cfg, model):
     global tracks, lost_tracks
     tracks = {}
     lost_tracks = {}
-    max_track_age = 150
-    max_lost_age = 3000000000
+    max_track_age = 50
     frame_number = 0
 
     print("启动实时检测与追踪 (按 'q' 退出)")
@@ -485,8 +473,6 @@ def do_test(args, cfg, model):
 
         if frame_number == 0:
             # 初始化tracks
-            tracks = {}
-            lost_tracks = {}
             for idx, detection in enumerate(detections):
                 detection['track_id'] = idx + 1
                 detection['age'] = 0    #目标存在帧数
@@ -495,7 +481,7 @@ def do_test(args, cfg, model):
             # 更新tracks
             current_detections = list(tracks.values())
             matches = match_detections(current_detections, detections)
-            tracks, updated_lost_tracks = update_tracks(tracks, lost_tracks, matches, current_detections, detections, max_track_age, max_lost_age)
+            tracks, updated_lost_tracks = update_tracks(tracks, lost_tracks, matches, current_detections, detections, max_track_age)
 
         # === 绘制与输出 ===
         meshes, meshes_text, meshes2, meshes2_text = [], [], [], []
