@@ -10,6 +10,7 @@ import logging
 import numpy as np
 import torch
 import cv2
+import math
 
 from cv2 import getTickCount, getTickFrequency
 from collections import OrderedDict, defaultdict
@@ -21,6 +22,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from scipy.optimize import linear_sum_assignment
 from pytorch3d.loss import chamfer_distance
 from pytorch3d.ops import box3d_overlap
+from pytorch3d.structures import Meshes
 
 # Local imports from cubercnn and detectron2
 from cubercnn.config import get_cfg_defaults
@@ -29,6 +31,7 @@ from cubercnn.modeling.roi_heads import ROIHeads3D
 from cubercnn.modeling.meta_arch import RCNN3D, build_model
 from cubercnn.modeling.backbone import build_dla_from_vision_fpn_backbone
 from cubercnn import util, vis
+
 
 # Suppress numpy scientific notation
 np.set_printoptions(suppress=True)
@@ -147,7 +150,7 @@ def compute_cost_matrix(corners1, corners2, scores1, scores2):
         cosine_costs = 1 - cosine_sim
 
     # === 加权融合 ===
-    alpha, beta, gamma, delta = 0.3, 0.1, 0.2, 0.4
+    alpha, beta, gamma, delta = 0.2, 0.1, 0.2, 0.4
     cost_matrix = (
         alpha * iou_3d_cost +
         beta * chamfer_dists +
@@ -371,45 +374,155 @@ def parse_detections(dets, thres, cats, target_cats):
 
     return parsed_detections
 
+def build_meshes_for_frame(im_rgb, K, tracks_dict, lost_dict, device, augmentations, model, thres, cats, target_cats, max_track_age, side="L"):  # side = "L" or "R"
+        # === 预处理 ===
+        aug_input = T.AugInput(im_rgb)
+        _ = augmentations(aug_input)
+        image = aug_input.image
+        image_shape = im_rgb.shape[:2]
+        batched = [{
+            'image': torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1))).to(device),
+            'height': image_shape[0],
+            'width': image_shape[1],
+            'K': K
+        }]
 
+        # === 推理 ===
+        with torch.no_grad():
+            dets = model(batched)[0]['instances']
+
+        # === 解析检测 ===
+        detections = parse_detections(dets, thres, cats, target_cats)
+        n_det = len(dets)
+
+        # ========= 跟踪更新（每路都独立进行）=========
+        if frame_number == 0:
+            for idx, detection in enumerate(detections):
+                new_id = idx + 1
+                detection['track_id'] = new_id
+                detection['age'] = 0
+                detection['side'] = side
+                tracks_dict[new_id] = detection
+        else:
+            current_detections = list(tracks_dict.values())
+            matches = match_detections(current_detections, detections)
+            new_tracks, new_lost = update_tracks(tracks_dict, lost_dict, matches,
+                                                 current_detections, detections, max_track_age)
+            tracks_dict = new_tracks
+            lost_dict = new_lost
+
+        # ========= 绘制 =========
+        meshes, meshes_text = [], []
+        meshes2, meshes2_text = [], []
+
+        # 1) Tracks mesh
+        for track_id, track in tracks_dict.items():
+            if track.get('age', 0) < max_track_age:
+                cat = track['category']
+                score = track['score']
+                meshes_text.append(f"{side}_door_{track_id}, {cat}, Scr: {score:.2f}")
+                bbox = track['bbox3D']
+                pose = track['pose']
+                color = [c / 255.0 for c in get_unique_color(track_id + 1000 if side == "R" else track_id)]  # 左右颜色不同
+                box_mesh = util.mesh_cuboid(bbox, pose.tolist(), color=color)
+                meshes.append(box_mesh)
+
+        # 2) Detections mesh（原始检测叠加）
+        if n_det > 0:
+            for idx, (corners3D2, center_cam2, _, dimensions2, pose2, score2, cat_idx2) in enumerate(zip(
+                dets.pred_bbox3D, dets.pred_center_cam, dets.pred_center_2D,
+                dets.pred_dimensions, dets.pred_pose, dets.scores, dets.pred_classes
+            )):
+                if score2 < thres:
+                    continue
+                cat2 = cats[int(cat_idx2)]
+                if cat2 not in target_cats:
+                    continue
+                bbox3D2 = center_cam2.tolist() + dimensions2.tolist()
+                meshes2_text.append(f"{cat2}, Scr: {score2:.2f}")
+
+                matched_track_id = None
+                for tid, trk in tracks_dict.items():
+                    if np.allclose(trk['corners3D'], corners3D2.cpu().numpy(), atol=1e-2):
+                        matched_track_id = tid
+                        break
+                color = [c / 255.0 for c in get_unique_color(matched_track_id + 1000 if side == "R" else matched_track_id)] \
+                        if matched_track_id else [c / 255.0 for c in util.get_color(idx)]
+                box_mesh2 = util.mesh_cuboid(bbox3D2, pose2.tolist(), color=color)
+                meshes2.append(box_mesh2)
+
+                print(f"[{side}] 物体 {cat2} 的位姿: {bbox3D2}")
+
+        return meshes, meshes_text, meshes2, meshes2_text, tracks_dict, lost_dict
+
+def translate_meshes(meshes, shift_x, rotate_deg):
+    meshes_shifted = []
+    if len(meshes) == 0:
+        return meshes_shifted
+    angle = math.radians(rotate_deg)
+    R = torch.tensor([[math.cos(angle), 0, math.sin(angle)],
+                        [0, 1, 0],
+                        [-math.sin(angle), 0, math.cos(angle)]], dtype=torch.float32)
+    for mesh in meshes:
+        device = mesh.device
+        verts = mesh.verts_list()[0].clone()
+        faces = mesh.faces_list()[0].clone()
+        textures = mesh.textures
+        center = verts.mean(dim=0, keepdim=True)
+        verts = verts - center
+        verts = verts @ R.to(device).T
+        verts = verts + center
+        verts[:, 0] += float(shift_x)
+        new_mesh = Meshes(verts=[verts], faces=[faces], textures=textures)
+        meshes_shifted.append(new_mesh)
+    return meshes_shifted
 
 # Dictionary to store active tracks
-tracks = {}
-lost_tracks = {}
+global tracks_left, lost_left, tracks_right, lost_right
+tracks_left   = {}
+lost_left     = {}
+tracks_right  = {}
+lost_right    = {}
 
 def do_test(args, cfg, model):
+    # ---------------- 视频输入处理 ----------------
+    video_left = getattr(args, 'input_video_left', None)
+    video_right = getattr(args, 'input_video_right', None)
+    video_single = getattr(args, 'input_video', None)
+    if video_left is None and video_right is None and video_single is None:
+        raise RuntimeError("请通过 --input-video-left & --input-video-right 提供左右视频，或使用 --input-video （兼容模式）")
+    if video_left is None and video_single is not None:
+        video_left = video_single
+    if video_right is None and video_single is not None:
+        video_right = video_single
+    cap_left = cv2.VideoCapture(video_left)
+    cap_right = cv2.VideoCapture(video_right)
+    if not cap_left.isOpened():
+        raise RuntimeError(f"无法打开左路视频: {video_left}")
+    if not cap_right.isOpened():
+        raise RuntimeError(f"无法打开右路视频: {video_right}")
 
-    # 视频路径
-    video_path = args.input_video
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"无法打开视频文件: {video_path}")
-    
-    # 可选：保存输出视频
-    save_video = getattr(args, 'save_video', False)
+    # ---------------- 视频保存 ----------------
+    save_video = getattr(args, 'save_video', None)
+    out_writer = None
     if save_video:
-        output_video_path = os.path.join(args.output_dir, "tracked_output.mp4")
+        w = int(cap_left.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap_left.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps_out = cap_left.get(cv2.CAP_PROP_FPS) or 30.0
+        output_video_path = os.path.join(save_video, "tracked_output_dual_top.mp4")
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        fps_out = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        frame_size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))*2, int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-        out_writer = cv2.VideoWriter(output_video_path, fourcc, fps_out, frame_size)
+        out_writer = cv2.VideoWriter(output_video_path, fourcc, fps_out, (w*3, h))
         print(f"将保存追踪结果到: {output_video_path}")
 
-    # 模型准备
+    # ---------------- 模型与参数 ----------------
     model.eval()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # 参数
     focal_length = args.focal_length
     principal_point = args.principal_point
     thres = args.threshold
-    # target_cats = args.target_cats if hasattr(args, 'target_cats') else []
-    target_cats = ['door']  
-    output_dir = args.output_dir if hasattr(args, 'output_dir') else "./output"
-    os.makedirs(output_dir, exist_ok=True)
-    display = getattr(args, 'display', True)
+    target_cats = ['door']
 
-    # 数据增强配置
+    # 数据增强
     min_size = cfg.INPUT.MIN_SIZE_TEST
     max_size = cfg.INPUT.MAX_SIZE_TEST
     augmentations = T.AugmentationList([T.ResizeShortestEdge(min_size, max_size, "choice")])
@@ -421,153 +534,107 @@ def do_test(args, cfg, model):
     metadata = util.load_json(category_path)
     cats = metadata['thing_classes']
 
-    # Tracking 初始化
-    global tracks, lost_tracks
-    tracks = {}
-    lost_tracks = {}
+    # ---------------- 真正独立的双目 tracks ----------------
+    global tracks_left, lost_left, tracks_right, lost_right, frame_number
+    tracks_left   = {}
+    lost_left     = {}
+    tracks_right  = {}
+    lost_right    = {}
     max_track_age = 50
     frame_number = 0
 
-    print("启动实时检测与追踪 (按 'q' 退出)")
+    R_topdown = util.euler2mat([np.pi/2, 0, 0])
 
+    # ---------------- 主循环 ----------------
     while True:
         loop_start = getTickCount()
-        ret, frame = cap.read()
-        if not ret:
+        ret_l, frame_l = cap_left.read()
+        ret_r, frame_r = cap_right.read()
+        if (not ret_l) or (not ret_r):
             break
 
-        # === 图像与相机内参 ===
-        im = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w = im.shape[:2]
+        im_l = cv2.cvtColor(frame_l, cv2.COLOR_BGR2RGB)
+        im_r = cv2.cvtColor(frame_r, cv2.COLOR_BGR2RGB)
+        h, w = im_l.shape[:2]
 
-        if focal_length == 0:
-            focal_length = 4.0 * h / 2
-        if len(principal_point) == 0:
-            px, py = w / 2, h / 2
+        # 相机内参
+        f = focal_length if focal_length != 0 else 4.0 * h / 2
+        px, py = (principal_point if len(principal_point) > 0 else (w/2, h/2))
+        K = np.array([[f,0,px],[0,f,py],[0,0,1]])
+
+        # 左右各自独立检测 + 独立跟踪
+        meshes_l, text_l, meshes2_l, text2_l, tracks_left, lost_left = build_meshes_for_frame(
+            im_l, K, tracks_left, lost_left, device, augmentations, model, thres, cats, target_cats, max_track_age, side="L")
+        meshes_r, text_r, meshes2_r, text2_r, tracks_right, lost_right = build_meshes_for_frame(
+            im_r, K, tracks_right, lost_right, device, augmentations, model, thres, cats, target_cats, max_track_age, side="R")
+        
+        # world shift（只平移 tracked boxes，dets 不用移）
+        meshes_l_shift = translate_meshes(meshes_l,  2, rotate_deg=90)
+        meshes_r_shift = translate_meshes(meshes_r, -2, rotate_deg=-90)
+        combined_shifted = meshes_l_shift + meshes_r_shift
+
+        # 以下可视化代码 100% 保留你原来的风格和顺序
+        # 1. 左摄像头：绘制 tracked boxes
+        # if len(meshes_l) > 0:
+        #     im_l_tracked, _, _ = vis.draw_scene_view(im_l, K, meshes_l, text=text_l,
+        #                                             scale=h, blend_weight=0.5, blend_weight_overlay=0.85)
+        #     im_l_front = im_l_tracked
+        # else:
+        im_l_front = im_l.copy()
+
+        if len(meshes2_l) > 0:
+            im_l_det, _, _ = vis.draw_scene_view(im_l, K, meshes2_l, text=text2_l,
+                                                scale=h, blend_weight=0.5, blend_weight_overlay=0.85)
+            im_l_front = ((im_l_front.astype(np.float32) + im_l_det.astype(np.float32)) / 2).astype(np.uint8)
+
+        # 3. 右摄像头
+        # if len(meshes_r) > 0:
+        #     im_r_tracked, _, _ = vis.draw_scene_view(im_r, K, meshes_r, text=text_r,
+        #                                             scale=h, blend_weight=0.5, blend_weight_overlay=0.85)
+        #     im_r_front = im_r_tracked
+        # else:
+        im_r_front = im_r.copy()
+
+        if len(meshes2_r) > 0:
+            im_r_det, _, _ = vis.draw_scene_view(im_r, K, meshes2_r, text=text2_r,
+                                                scale=h, blend_weight=0.5, blend_weight_overlay=0.85)
+            im_r_front = ((im_r_front.astype(np.float32) + im_r_det.astype(np.float32)) / 2).astype(np.uint8)
+
+        # 5. Top-down
+        if len(combined_shifted) == 0:
+            im_topdown = np.ones((h, w, 3), dtype=np.uint8) * 225
         else:
-            px, py = principal_point
+            xs_all = np.concatenate([m.verts_padded()[0].cpu().numpy()[:,0] for m in combined_shifted])
+            ys_all = np.concatenate([m.verts_padded()[0].cpu().numpy()[:,1] for m in combined_shifted])
+            zs_all = np.concatenate([m.verts_padded()[0].cpu().numpy()[:,2] for m in combined_shifted])
+            pad = 3.0
+            ground_bounds = (ys_all.max(), xs_all.min()-pad, xs_all.max()+pad, zs_all.min()-pad, zs_all.max()+pad)
+            im_topdown, _ = vis.draw_scene_view(im_l, K, combined_shifted, text=None,
+                                               scale=h, R=R_topdown, mode='novel',
+                                               ground_bounds=ground_bounds,
+                                               blend_weight=0.5, blend_weight_overlay=0.85)
+            im_topdown = cv2.resize(im_topdown, (w, h))
 
-        K = np.array([
-            [focal_length, 0.0, px],
-            [0.0, focal_length, py],
-            [0.0, 0.0, 1.0]
-        ])
-
-        # === 预处理 ===
-        aug_input = T.AugInput(im)
-        _ = augmentations(aug_input)
-        image = aug_input.image
-        batched = [{
-            'image': torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1))).to(device),
-            'height': h, 'width': w, 'K': K
-        }]
-
-        # === 推理 ===
-        with torch.no_grad():
-            outputs = model(batched)[0]['instances']
-        n_det = len(outputs)
-
-        # === 解析检测 ===
-        detections = parse_detections(outputs, thres, cats, target_cats)
-        # detections = remove_lowest_score_detection(detections)
-
-        if frame_number == 0:
-            # 初始化tracks
-            for idx, detection in enumerate(detections):
-                detection['track_id'] = idx + 1
-                detection['age'] = 0    #目标存在帧数
-                tracks[idx + 1] = detection
-        else:
-            # 更新tracks
-            current_detections = list(tracks.values())
-            matches = match_detections(current_detections, detections)
-            tracks, updated_lost_tracks = update_tracks(tracks, lost_tracks, matches, current_detections, detections, max_track_age)
-
-        # === 绘制与输出 ===
-        meshes, meshes_text, meshes2, meshes2_text = [], [], [], []
-
-        for track_id, track in tracks.items():
-            if track['age'] < max_track_age:
-                cat = track['category']
-                score = track['score']
-                meshes_text.append(f"T-ID: {track_id}, Category: {cat}, Scr: {score:.2f}")
-                bbox = track['bbox3D']
-                pose = track['pose']
-                color = [c / 255.0 for c in get_unique_color(track_id)]
-                box_mesh = util.mesh_cuboid(bbox, pose.tolist(), color=color)
-                meshes.append(box_mesh)
-
-        if n_det > 0:
-            # 原始检测绘制
-            for idx, (corners3D2, center_cam2, center_2D2, dimensions2, pose2, score2, cat_idx2) in enumerate(zip(
-                    outputs.pred_bbox3D, outputs.pred_center_cam, outputs.pred_center_2D, outputs.pred_dimensions,
-                    outputs.pred_pose, outputs.scores, outputs.pred_classes
-            )): 
-                if score2 < thres:
-                    continue
-                cat2 = cats[cat_idx2]
-                if cat2 not in target_cats and len(target_cats) > 0:
-                    continue
-                bbox3D2 = center_cam2.tolist() + dimensions2.tolist()
-                meshes2_text.append(f"Category: {cat2}, Scr: {score2:.2f}")
-
-                matched_track_id = None
-                for track_id, track in tracks.items():
-                    if np.allclose(track['corners3D'], corners3D2.cpu().numpy(), atol=1e-2):
-                        matched_track_id = track_id
-                        break
-
-                if matched_track_id is not None:
-                    color = [c / 255.0 for c in get_unique_color(matched_track_id)]
-                else:
-                    color = [c / 255.0 for c in util.get_color(idx)]
-
-                box_mesh2 = util.mesh_cuboid(bbox3D2, pose2.tolist(), color=color)
-                meshes2.append(box_mesh2)
-                print (f"物体: {cat2} 的位姿: {center_cam2.tolist() + dimensions2.tolist()}")
-
-        # === 可视化 ===
-        im_drawn_rgb = im.copy()
-        im_topdown = np.zeros_like(im_drawn_rgb)
-        h, w = im.shape[:2]  # 以原图大小为基准
-        # 绘制 tracked boxes
-        if len(meshes) > 0:
-            im_drawn_rgb_tracked, im_topdown_tracked, _ = vis.draw_scene_view(
-                im, K, meshes, text=meshes_text,
-                scale=im.shape[0], blend_weight=0.5, blend_weight_overlay=0.85
-            )
-            # im_drawn_rgb = im_drawn_rgb_tracked
-            im_topdown = im_topdown_tracked
-
-        # 绘制原始检测 boxes
-        if len(meshes2) > 0:
-            im_drawn_rgb_det, im_topdown_det, _ = vis.draw_scene_view(
-                im, K, meshes2, text=meshes2_text,
-                scale=im.shape[0], blend_weight=0.5, blend_weight_overlay=0.85
-            )
-            # 将原始检测叠加在 tracked 图上
-            im_drawn_rgb = ((im_drawn_rgb.astype(np.float32) + im_drawn_rgb_det.astype(np.float32)) / 2).astype(np.uint8)
-            # 保证尺寸一致
-            im_topdown_det_resized = cv2.resize(im_topdown_det, (im_topdown.shape[1], im_topdown.shape[0]))
-            # 然后再融合
-            im_topdown = ((im_topdown.astype(np.float32) + im_topdown_det_resized.astype(np.float32)) / 2).astype(np.uint8)
-
-
-        # 拼接显示
-        im_concat = np.concatenate((im_drawn_rgb, im_topdown), axis=1)
-        im_display = cv2.cvtColor(im_concat.astype(np.uint8), cv2.COLOR_RGB2BGR)
-
-        # === FPS 显示 ===
-        fps = int(getTickFrequency() / (getTickCount() - loop_start))
-        cv2.putText(im_display, f'FPS: {fps}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.imshow("Real-time 3D Detection + Tracking", im_display)
-
+        # 6. 拼接显示
+        im_l_front_resized = cv2.resize(im_l_front, (w, h))
+        im_r_front_resized = cv2.resize(im_r_front, (w, h))
+        im_topdown_resized = cv2.resize(im_topdown, (w, h))
+        final_concat = np.concatenate((im_l_front_resized, im_topdown_resized, im_r_front_resized), axis=1)
+        final_concat = cv2.cvtColor(final_concat.astype(np.uint8), cv2.COLOR_RGB2BGR)
+        fps = int(getTickFrequency() / max(1, (getTickCount() - loop_start)))
+        cv2.putText(final_concat, f'FPS: {fps}', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+        cv2.imshow('Real-time 3D Detection (L | Top | R)', final_concat)
+        if save_video and out_writer is not None:
+            out_writer.write(final_concat)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
         frame_number += 1
 
-    cap.release()
+    cap_left.release()
+    cap_right.release()
+    if out_writer is not None:
+        out_writer.release()
     cv2.destroyAllWindows()
     print("摄像头关闭，程序结束")
 
@@ -619,11 +686,14 @@ if __name__ == "__main__":
         epilog=None, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--config-file", default="", metavar="FILE", help="path to config file")
-    parser.add_argument('--input-video', type=str, help='path to input video', required=True)
-    parser.add_argument('--save-video', action='store_true', help='是否把带追踪结果的画面保存为视频')
+    parser.add_argument('--input-video', type=str, help='path to input video (legacy, used for both left & right if others not provided)', required=False)
+    parser.add_argument('--input-video-left', type=str, help='path to left input video', required=False)
+    parser.add_argument('--input-video-right', type=str, help='path to right input video', required=False)
+
+    parser.add_argument('--save-video', type=str, help='是否把带追踪结果的画面保存为视频')
     parser.add_argument("--focal-length", type=float, default=0, help="focal length for image inputs (in px)")
     parser.add_argument("--principal-point", type=float, default=[], nargs=2, help="principal point for image inputs (in px)")
-    parser.add_argument("--threshold", type=float, default=0.30, help="threshold on score for visualizing")
+    parser.add_argument("--threshold", type=float, default=0.40, help="threshold on score for visualizing")
     parser.add_argument("--display", default=False, action="store_true", help="Whether to show the images in matplotlib",)
     parser.add_argument("--categories", nargs='*', default= [] , help="List of target categories to detect and track")
 
