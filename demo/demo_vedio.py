@@ -121,24 +121,24 @@ def compute_cost_matrix(corners1, corners2, scores1, scores2):
     if len(corners1) == 0 or len(corners2) == 0:
         return np.zeros((len(corners1), len(corners2)), dtype=np.float32)
 
-    # === corners 转 tensor ===
+    # corners 转 tensor
     corners1 = np.stack(corners1)
     corners2 = np.stack(corners2)
     corners1 = torch.as_tensor(corners1, dtype=torch.float32)
     corners2 = torch.as_tensor(corners2, dtype=torch.float32)
 
-    # === 3D IoU ===
+    # 3D IoU
     vol, iou_3d = box3d_overlap(corners1, corners2)
     iou_3d_cost = 1 - iou_3d
 
-    # === GIoU ===
+    # GIoU 
     giou = generalized_box_iou_3d(corners1, corners2)
     giou_cost = 1 - giou
 
-    # === Chamfer Distance ===
+    # Chamfer Distance
     chamfer_dists = compute_chamfer_distance(corners1, corners2)
 
-    # === Cosine Similarity ===
+    # Cosine Similarity
     if len(scores1) == 0 or len(scores2) == 0:
         cosine_costs = torch.zeros_like(iou_3d_cost)
     else:
@@ -149,7 +149,7 @@ def compute_cost_matrix(corners1, corners2, scores1, scores2):
         cosine_sim = torch.mm(s1_norm, s2_norm.T)
         cosine_costs = 1 - cosine_sim
 
-    # === 加权融合 ===
+    # 加权融合
     alpha, beta, gamma, delta = 0.2, 0.1, 0.2, 0.4
     cost_matrix = (
         alpha * iou_3d_cost +
@@ -375,7 +375,7 @@ def parse_detections(dets, thres, cats, target_cats):
     return parsed_detections
 
 def build_meshes_for_frame(im_rgb, K, tracks_dict, lost_dict, device, augmentations, model, thres, cats, target_cats, max_track_age, side="L"):  # side = "L" or "R"
-        # === 预处理 ===
+        # 预处理 
         aug_input = T.AugInput(im_rgb)
         _ = augmentations(aug_input)
         image = aug_input.image
@@ -387,15 +387,15 @@ def build_meshes_for_frame(im_rgb, K, tracks_dict, lost_dict, device, augmentati
             'K': K
         }]
 
-        # === 推理 ===
+        # 推理 
         with torch.no_grad():
             dets = model(batched)[0]['instances']
 
-        # === 解析检测 ===
+        # 解析检测 
         detections = parse_detections(dets, thres, cats, target_cats)
         n_det = len(dets)
 
-        # ========= 跟踪更新（每路都独立进行）=========
+        # 跟踪更新（每路都独立进行）
         if frame_number == 0:
             for idx, detection in enumerate(detections):
                 new_id = idx + 1
@@ -411,11 +411,11 @@ def build_meshes_for_frame(im_rgb, K, tracks_dict, lost_dict, device, augmentati
             tracks_dict = new_tracks
             lost_dict = new_lost
 
-        # ========= 绘制 =========
+        # 绘制 
         meshes, meshes_text = [], []
         meshes2, meshes2_text = [], []
 
-        # 1) Tracks mesh
+        # Tracks mesh
         for track_id, track in tracks_dict.items():
             if track.get('age', 0) < max_track_age:
                 cat = track['category']
@@ -427,7 +427,7 @@ def build_meshes_for_frame(im_rgb, K, tracks_dict, lost_dict, device, augmentati
                 box_mesh = util.mesh_cuboid(bbox, pose.tolist(), color=color)
                 meshes.append(box_mesh)
 
-        # 2) Detections mesh（原始检测叠加）
+        # Detections mesh（原始检测叠加）
         if n_det > 0:
             for idx, (corners3D2, center_cam2, _, dimensions2, pose2, score2, cat_idx2) in enumerate(zip(
                 dets.pred_bbox3D, dets.pred_center_cam, dets.pred_center_2D,
@@ -485,16 +485,12 @@ tracks_right  = {}
 lost_right    = {}
 
 def do_test(args, cfg, model):
-    # ---------------- 视频输入处理 ----------------
+
+    # 视频路径
     video_left = getattr(args, 'input_video_left', None)
     video_right = getattr(args, 'input_video_right', None)
-    video_single = getattr(args, 'input_video', None)
-    if video_left is None and video_right is None and video_single is None:
-        raise RuntimeError("请通过 --input-video-left & --input-video-right 提供左右视频，或使用 --input-video （兼容模式）")
-    if video_left is None and video_single is not None:
-        video_left = video_single
-    if video_right is None and video_single is not None:
-        video_right = video_single
+    if video_left is None and video_right is None:
+        raise RuntimeError("请通过 --input-video-left & --input-video-right 提供左右视频")
     cap_left = cv2.VideoCapture(video_left)
     cap_right = cv2.VideoCapture(video_right)
     if not cap_left.isOpened():
@@ -502,7 +498,7 @@ def do_test(args, cfg, model):
     if not cap_right.isOpened():
         raise RuntimeError(f"无法打开右路视频: {video_right}")
 
-    # ---------------- 视频保存 ----------------
+    # 可选：保存输出视频
     save_video = getattr(args, 'save_video', None)
     out_writer = None
     if save_video:
@@ -514,13 +510,14 @@ def do_test(args, cfg, model):
         out_writer = cv2.VideoWriter(output_video_path, fourcc, fps_out, (w*3, h))
         print(f"将保存追踪结果到: {output_video_path}")
 
-    # ---------------- 模型与参数 ----------------
+    # 模型准备
     model.eval()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 参数
     focal_length = args.focal_length
     principal_point = args.principal_point
     thres = args.threshold
-    target_cats = ['door']
 
     # 数据增强
     min_size = cfg.INPUT.MIN_SIZE_TEST
@@ -533,8 +530,9 @@ def do_test(args, cfg, model):
         category_path = util.CubeRCNNHandler._get_local_path(util.CubeRCNNHandler, category_path)
     metadata = util.load_json(category_path)
     cats = metadata['thing_classes']
+    target_cats = ['door']
 
-    # ---------------- 真正独立的双目 tracks ----------------
+    # Tracking 初始化
     global tracks_left, lost_left, tracks_right, lost_right, frame_number
     tracks_left   = {}
     lost_left     = {}
@@ -545,7 +543,6 @@ def do_test(args, cfg, model):
 
     R_topdown = util.euler2mat([np.pi/2, 0, 0])
 
-    # ---------------- 主循环 ----------------
     while True:
         loop_start = getTickCount()
         ret_l, frame_l = cap_left.read()
@@ -573,34 +570,21 @@ def do_test(args, cfg, model):
         meshes_r_shift = translate_meshes(meshes_r, -2, rotate_deg=-90)
         combined_shifted = meshes_l_shift + meshes_r_shift
 
-        # 以下可视化代码 100% 保留你原来的风格和顺序
-        # 1. 左摄像头：绘制 tracked boxes
-        # if len(meshes_l) > 0:
-        #     im_l_tracked, _, _ = vis.draw_scene_view(im_l, K, meshes_l, text=text_l,
-        #                                             scale=h, blend_weight=0.5, blend_weight_overlay=0.85)
-        #     im_l_front = im_l_tracked
-        # else:
+        # 左摄像头：绘制 left tracked boxes
         im_l_front = im_l.copy()
-
         if len(meshes2_l) > 0:
             im_l_det, _, _ = vis.draw_scene_view(im_l, K, meshes2_l, text=text2_l,
                                                 scale=h, blend_weight=0.5, blend_weight_overlay=0.85)
             im_l_front = ((im_l_front.astype(np.float32) + im_l_det.astype(np.float32)) / 2).astype(np.uint8)
 
-        # 3. 右摄像头
-        # if len(meshes_r) > 0:
-        #     im_r_tracked, _, _ = vis.draw_scene_view(im_r, K, meshes_r, text=text_r,
-        #                                             scale=h, blend_weight=0.5, blend_weight_overlay=0.85)
-        #     im_r_front = im_r_tracked
-        # else:
+        # 右摄像头：绘制 right tracked boxes
         im_r_front = im_r.copy()
-
         if len(meshes2_r) > 0:
             im_r_det, _, _ = vis.draw_scene_view(im_r, K, meshes2_r, text=text2_r,
                                                 scale=h, blend_weight=0.5, blend_weight_overlay=0.85)
             im_r_front = ((im_r_front.astype(np.float32) + im_r_det.astype(np.float32)) / 2).astype(np.uint8)
 
-        # 5. Top-down
+        # Top-down
         if len(combined_shifted) == 0:
             im_topdown = np.ones((h, w, 3), dtype=np.uint8) * 225
         else:
@@ -615,7 +599,7 @@ def do_test(args, cfg, model):
                                                blend_weight=0.5, blend_weight_overlay=0.85)
             im_topdown = cv2.resize(im_topdown, (w, h))
 
-        # 6. 拼接显示
+        # 拼接显示
         im_l_front_resized = cv2.resize(im_l_front, (w, h))
         im_r_front_resized = cv2.resize(im_r_front, (w, h))
         im_topdown_resized = cv2.resize(im_topdown, (w, h))
@@ -672,11 +656,6 @@ def main(args):
     #     "cubercnn_DLA34_FPN_outdoor.pth", resume=True
     # )
 
-    # DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
-    #     "/home/skyuan/omni3d_with_tracking/cubercnn_DLA34_FPN.pth", resume=True
-    # )
-
-
     with torch.no_grad():
         do_test(args, cfg, model)
 
@@ -686,7 +665,6 @@ if __name__ == "__main__":
         epilog=None, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--config-file", default="", metavar="FILE", help="path to config file")
-    parser.add_argument('--input-video', type=str, help='path to input video (legacy, used for both left & right if others not provided)', required=False)
     parser.add_argument('--input-video-left', type=str, help='path to left input video', required=False)
     parser.add_argument('--input-video-right', type=str, help='path to right input video', required=False)
 
