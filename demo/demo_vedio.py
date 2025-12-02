@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import cv2
 import math
+import copy
 
 from cv2 import getTickCount, getTickFrequency
 from collections import OrderedDict, defaultdict
@@ -263,54 +264,87 @@ def match_detections(detections1, detections2):
 
     return matches
 
-def update_tracks(tracks, lost_tracks, matches, detections1, detections2, max_age=150):
-    """
-    Updates track dictionary with matched detections, ages existing tracks,
-    and adds new objects as tracks when no match is found.
-
-    Args:
-        tracks (dict): Current set of active tracks.
-        matches (list): List of matched indices between the two detection sets.
-        detections1 (list): Detections from the first frame.
-        detections2 (list): Detections from the second frame.
-        max_age (int): Maximum age before removing a track.
+def update_tracks(tracks, global_tracks, matches, detections1, detections2, max_age, frame_number):
     
-    Returns:
-        updated_tracks (dict): Updated dictionary of tracks.
-    """
+    global GLOBAL_NEXT_TRACK_ID, GLOBAL_APPEAR_STEPS
     matched_indices = set()
     updated_tracks = {}
-    updated_lost_tracks = {}
+    y_step = 1
 
-    # Update matched tracks
+    # matched：保持 id，不要共享引用（深拷贝）
     for i, j in matches:
-        track_id = detections1[i]['track_id']
-        detections2[j]['track_id'] = track_id
-        updated_tracks[track_id] = detections2[j]
-        updated_tracks[track_id]['age'] = 0  # Reset track age after a match
+        track_id = int(detections1[i]['track_id'])
+        det = copy.deepcopy(detections2[j])
+        det['track_id'] = track_id
+        det['age'] = 0
+        det['start_frame'] = detections1[i].get('start_frame', frame_number)
+        updated_tracks[track_id] = det
         matched_indices.add(j)
 
-    # Age the tracks that were not updated
-    for track_id, track in tracks.items():
-        if track_id not in updated_tracks:
-            track['age'] += 1
-            if track['age'] < max_age:
-                updated_tracks[track_id] = track
+    # age & lost
+    newly_lost = []
+    for tracks_id, tracks in list(tracks.items()):
+        if tracks_id not in updated_tracks:
+            tracks['age'] = tracks.get('age', 0) + 1
+            if tracks['age'] < max_age:
+                updated_tracks[tracks_id] = copy.deepcopy(tracks)
             else:
-                updated_lost_tracks[track_id] = track  # Move to lost tracks
+                tracks['start_frame'] = frame_number
+                newly_lost.append((tracks_id, copy.deepcopy(tracks)))
 
-    # Add new objects as tracks
-    existing_ids = set(list(updated_tracks.keys()) + list(updated_lost_tracks.keys()))
+    # 把真正 lost 的深拷入 global 
+    for tracks_id, tracks in newly_lost:
+        if tracks_id not in global_tracks:
+            global_tracks[tracks_id] = copy.deepcopy(tracks)
+
+    # 新检测到的物体分配全局唯一 id
     for idx, det in enumerate(detections2):
         if idx not in matched_indices:
-            new_id = max(tracks.keys(), default=0) + 1
-            det['track_id'] = new_id
-            det['age'] = 0
-            updated_tracks[new_id] = det
-            existing_ids.add(new_id)
+            new_id = GLOBAL_NEXT_TRACK_ID
+            GLOBAL_NEXT_TRACK_ID += 1
+            dcopy = copy.deepcopy(det)
+            dcopy['track_id'] = new_id
+            dcopy['age'] = 0
+            updated_tracks[new_id] = dcopy
+            
+            if len(global_tracks) == 0:
+                # 第一个门，不计算 diff
+                print(f"[Track {new_id}] 第一个门出现，不计算 diff")
+                continue
 
-    return updated_tracks, updated_lost_tracks
+            if len(global_tracks) > 0:
+                print(f"[Track {new_id}] 第二个门出现，开始计算 diff")
+                oldest_lost_id = sorted(global_tracks.keys())[0]
+                oldest = global_tracks[oldest_lost_id]
+                sf = oldest.get('start_frame', frame_number)
+                ef = frame_number
+                diff = ef - sf
+                if (diff > 2):
+                    GLOBAL_APPEAR_STEPS.append(diff)
 
+                print(f"[Track {oldest_lost_id}] 生命周期帧差 = {diff} (start={sf}, end={ef})")
+
+    if len(GLOBAL_APPEAR_STEPS) > 0:
+        y_step = GLOBAL_APPEAR_STEPS[-1]
+    else:
+        y_step = 1
+
+    # 对 global 进行稳定排序并重新赋值对应的 z 分量（top-down 使用 x,z）
+    if len(global_tracks) > 1 and len(newly_lost) > 0:
+        last_gid = sorted(global_tracks.keys())[-1]   # 取最后一个 track_id
+        g = copy.deepcopy(global_tracks[last_gid])
+        g['bbox3D'][2] = (2.5 + y_step / 25.0)  # 用 global_tracks 总数来计算偏移
+        global_tracks[last_gid] = g
+
+        # debug
+        print(f"--------------step::::::{(2.5 + y_step / 25.0)}-------------------")
+
+    # debug
+    # for tracks_id, tracks in sorted(global_tracks.items()):
+    #     x, y, z = tracks['bbox3D'][:3]
+    #     print(f"id {tracks_id} bbox3D: {tracks['bbox3D']}  top=(x,z)=({x:.3f},{z:.3f})")
+
+    return updated_tracks, global_tracks
 
 def get_unique_color(track_id):
     """
@@ -374,7 +408,7 @@ def parse_detections(dets, thres, cats, target_cats):
 
     return parsed_detections
 
-def build_meshes_for_frame(im_rgb, K, tracks_dict, lost_dict, device, augmentations, model, thres, cats, target_cats, max_track_age, side="L"):  # side = "L" or "R"
+def build_meshes_for_frame(im_rgb, K, tracks_dict, gobal_tracks_dict, device, augmentations, model, thres, cats, target_cats, max_track_age, frame_number, side="L"):  # side = "L" or "R"
         # 预处理 
         aug_input = T.AugInput(im_rgb)
         _ = augmentations(aug_input)
@@ -402,18 +436,20 @@ def build_meshes_for_frame(im_rgb, K, tracks_dict, lost_dict, device, augmentati
                 detection['track_id'] = new_id
                 detection['age'] = 0
                 detection['side'] = side
+                detection['start_frame'] = frame_number
                 tracks_dict[new_id] = detection
         else:
             current_detections = list(tracks_dict.values())
             matches = match_detections(current_detections, detections)
-            new_tracks, new_lost = update_tracks(tracks_dict, lost_dict, matches,
-                                                 current_detections, detections, max_track_age)
+            new_tracks, new_global_tracks = update_tracks(tracks_dict, gobal_tracks_dict, matches,
+                                                 current_detections, detections, max_track_age, frame_number)
             tracks_dict = new_tracks
-            lost_dict = new_lost
+            gobal_tracks_dict = new_global_tracks
 
         # 绘制 
         meshes, meshes_text = [], []
         meshes2, meshes2_text = [], []
+        gobal_meshes, gobal_meshes_text = [], []
 
         # Tracks mesh
         for track_id, track in tracks_dict.items():
@@ -426,6 +462,17 @@ def build_meshes_for_frame(im_rgb, K, tracks_dict, lost_dict, device, augmentati
                 color = [c / 255.0 for c in get_unique_color(track_id + 1000 if side == "R" else track_id)]  # 左右颜色不同
                 box_mesh = util.mesh_cuboid(bbox, pose.tolist(), color=color)
                 meshes.append(box_mesh)
+        
+        # Gobal mesh
+        for track_id, track in gobal_tracks_dict.items():
+                gobal_cat = track['category']
+                gobal_score = track['score']
+                gobal_meshes_text.append(f"{side}_door_{track_id}, {gobal_cat}, Scr: {gobal_score:.2f} (Lost)")
+                gobal_bbox = track['bbox3D']
+                gobal_pose = track['pose']
+                gobal_color = [0.5, 0.5, 0.5]  # 灰色表示丢失的目标
+                gobal_box_mesh = util.mesh_cuboid(gobal_bbox, gobal_pose.tolist(), color=gobal_color)
+                gobal_meshes.append(gobal_box_mesh)
 
         # Detections mesh（原始检测叠加）
         if n_det > 0:
@@ -453,16 +500,16 @@ def build_meshes_for_frame(im_rgb, K, tracks_dict, lost_dict, device, augmentati
 
                 print(f"[{side}] 物体 {cat2} 的位姿: {bbox3D2}")
 
-        return meshes, meshes_text, meshes2, meshes2_text, tracks_dict, lost_dict
+        return meshes, meshes_text, meshes2, meshes2_text, gobal_meshes, gobal_meshes_text, tracks_dict, gobal_tracks_dict
 
 def translate_meshes(meshes, shift_x, rotate_deg):
     meshes_shifted = []
     if len(meshes) == 0:
         return meshes_shifted
     angle = math.radians(rotate_deg)
-    R = torch.tensor([[math.cos(angle), 0, math.sin(angle)],
+    R = torch.tensor([[math.cos(-angle), 0, math.sin(-angle)],
                         [0, 1, 0],
-                        [-math.sin(angle), 0, math.cos(angle)]], dtype=torch.float32)
+                        [-math.sin(-angle), 0, math.cos(-angle)]], dtype=torch.float32)
     for mesh in meshes:
         device = mesh.device
         verts = mesh.verts_list()[0].clone()
@@ -478,11 +525,14 @@ def translate_meshes(meshes, shift_x, rotate_deg):
     return meshes_shifted
 
 # Dictionary to store active tracks
-global tracks_left, lost_left, tracks_right, lost_right
-tracks_left   = {}
-lost_left     = {}
-tracks_right  = {}
-lost_right    = {}
+global tracks_left, gobal_tracks_left, tracks_right, gobal_tracks_right, GLOBAL_NEXT_TRACK_ID, GLOBAL_APPEAR_STEPS
+tracks_left = {}
+gobal_tracks_left = {}
+tracks_right = {}
+gobal_tracks_right = {}
+GLOBAL_NEXT_TRACK_ID = 1
+GLOBAL_APPEAR_STEPS = []
+
 
 def do_test(args, cfg, model):
 
@@ -533,15 +583,21 @@ def do_test(args, cfg, model):
     target_cats = ['door']
 
     # Tracking 初始化
-    global tracks_left, lost_left, tracks_right, lost_right, frame_number
+    global tracks_left, gobal_tracks_left, tracks_right, gobal_tracks_right, frame_number, GLOBAL_NEXT_TRACK_ID
     tracks_left   = {}
-    lost_left     = {}
+    gobal_tracks_left     = {}
     tracks_right  = {}
-    lost_right    = {}
-    max_track_age = 50
+    gobal_tracks_right    = {}
+    max_track_age = 30
     frame_number = 0
+    GLOBAL_NEXT_TRACK_ID = 1
 
-    R_topdown = util.euler2mat([np.pi/2, 0, 0])
+    R_topdown = np.array([
+        [1, 0, 0],
+        [0, 0, 1],
+        [0,-1, 0]
+    ], dtype=np.float32)
+
 
     while True:
         loop_start = getTickCount()
@@ -560,15 +616,19 @@ def do_test(args, cfg, model):
         K = np.array([[f,0,px],[0,f,py],[0,0,1]])
 
         # 左右各自独立检测 + 独立跟踪
-        meshes_l, text_l, meshes2_l, text2_l, tracks_left, lost_left = build_meshes_for_frame(
-            im_l, K, tracks_left, lost_left, device, augmentations, model, thres, cats, target_cats, max_track_age, side="L")
-        meshes_r, text_r, meshes2_r, text2_r, tracks_right, lost_right = build_meshes_for_frame(
-            im_r, K, tracks_right, lost_right, device, augmentations, model, thres, cats, target_cats, max_track_age, side="R")
+        meshes_l, text_l, meshes2_l, text2_l, gobal_meshes_l, gobal_meshes_text_l, tracks_left, gobal_tracks_left = build_meshes_for_frame(
+            im_l, K, tracks_left, gobal_tracks_left, device, augmentations, model, thres, cats, target_cats, max_track_age, frame_number, side="L")
+        meshes_r, text_r, meshes2_r, text2_r, gobal_meshes_r, gobal_meshes_text_r, tracks_right, gobal_tracks_right = build_meshes_for_frame(
+            im_r, K, tracks_right, gobal_tracks_right, device, augmentations, model, thres, cats, target_cats, max_track_age, frame_number, side="R")
         
         # world shift（只平移 tracked boxes，dets 不用移）
         meshes_l_shift = translate_meshes(meshes_l,  2, rotate_deg=90)
-        meshes_r_shift = translate_meshes(meshes_r, -2, rotate_deg=-90)
+        meshes_r_shift = translate_meshes(meshes_r, -2, rotate_deg=90)
         combined_shifted = meshes_l_shift + meshes_r_shift
+
+        gobal_meshes_l_shift = translate_meshes(gobal_meshes_l,  2, rotate_deg=90)
+        gobal_meshes_r_shift = translate_meshes(gobal_meshes_r, -2, rotate_deg=90)
+        gobal_combined_shifted = gobal_meshes_l_shift + gobal_meshes_r_shift
 
         # 左摄像头：绘制 left tracked boxes
         im_l_front = im_l.copy()
@@ -585,15 +645,21 @@ def do_test(args, cfg, model):
             im_r_front = ((im_r_front.astype(np.float32) + im_r_det.astype(np.float32)) / 2).astype(np.uint8)
 
         # Top-down
-        if len(combined_shifted) == 0:
+        # print("全局跟踪目标数（Top-Down 显示）:", len(gobal_combined_shifted))
+        if len(gobal_combined_shifted) == 0:
             im_topdown = np.ones((h, w, 3), dtype=np.uint8) * 225
         else:
-            xs_all = np.concatenate([m.verts_padded()[0].cpu().numpy()[:,0] for m in combined_shifted])
-            ys_all = np.concatenate([m.verts_padded()[0].cpu().numpy()[:,1] for m in combined_shifted])
-            zs_all = np.concatenate([m.verts_padded()[0].cpu().numpy()[:,2] for m in combined_shifted])
+            xs_all = np.concatenate([m.verts_padded()[0].cpu().numpy()[:,0] for m in gobal_combined_shifted])
+            ys_all = np.concatenate([m.verts_padded()[0].cpu().numpy()[:,1] for m in gobal_combined_shifted])
+            zs_all = np.concatenate([m.verts_padded()[0].cpu().numpy()[:,2] for m in gobal_combined_shifted])
             pad = 3.0
+            print("xs:", xs_all.min(), xs_all.max())
+            print("zs:", zs_all.min(), zs_all.max())
+            print("ys:", ys_all.min(), ys_all.max())
+
             ground_bounds = (ys_all.max(), xs_all.min()-pad, xs_all.max()+pad, zs_all.min()-pad, zs_all.max()+pad)
-            im_topdown, _ = vis.draw_scene_view(im_l, K, combined_shifted, text=None,
+
+            im_topdown, _ = vis.draw_scene_view(im_l, K, gobal_combined_shifted, text=None,
                                                scale=h, R=R_topdown, mode='novel',
                                                ground_bounds=ground_bounds,
                                                blend_weight=0.5, blend_weight_overlay=0.85)
