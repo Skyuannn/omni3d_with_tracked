@@ -264,12 +264,11 @@ def match_detections(detections1, detections2):
 
     return matches
 
-def update_tracks(tracks, global_tracks, matches, detections1, detections2, max_age, frame_number):
+def update_tracks(tracks, global_tracks, matches, detections1, detections2, max_age, frame_number, real_time_diff):
     
     global GLOBAL_NEXT_TRACK_ID, GLOBAL_APPEAR_STEPS
     matched_indices = set()
     updated_tracks = {}
-    y_step = 1
 
     # matched：保持 id，不要共享引用（深拷贝）
     for i, j in matches:
@@ -277,7 +276,6 @@ def update_tracks(tracks, global_tracks, matches, detections1, detections2, max_
         det = copy.deepcopy(detections2[j])
         det['track_id'] = track_id
         det['age'] = 0
-        det['start_frame'] = detections1[i].get('start_frame', frame_number)
         updated_tracks[track_id] = det
         matched_indices.add(j)
 
@@ -290,12 +288,27 @@ def update_tracks(tracks, global_tracks, matches, detections1, detections2, max_
                 updated_tracks[tracks_id] = copy.deepcopy(tracks)
             else:
                 tracks['start_frame'] = frame_number
+                tracks['end_frame'] = frame_number
                 newly_lost.append((tracks_id, copy.deepcopy(tracks)))
 
     # 把真正 lost 的深拷入 global 
     for tracks_id, tracks in newly_lost:
         if tracks_id not in global_tracks:
             global_tracks[tracks_id] = copy.deepcopy(tracks)
+
+    if len(global_tracks) > 0:
+        global_id = sorted(global_tracks.keys())
+        last_global_id = global_id[-1]
+        last_track = global_tracks[last_global_id]
+
+        sf_for_real_time = last_track.get('start_frame', frame_number)
+        ef_for_real_time = last_track.get('end_frame', frame_number)
+        real_time_diff = ef_for_real_time - sf_for_real_time
+        ef_for_real_time += 1
+        last_track['end_frame'] = ef_for_real_time
+        global_tracks[last_global_id] = last_track
+        # 仅计算，不加入 GLOBAL_APPEAR_STEPS
+    print(f"[RealTimeDiff] 两门帧数diff: {real_time_diff}")
 
     # 新检测到的物体分配全局唯一 id
     for idx, det in enumerate(detections2):
@@ -313,39 +326,25 @@ def update_tracks(tracks, global_tracks, matches, detections1, detections2, max_
                 continue
 
             if len(global_tracks) > 0:
-                print(f"[Track {new_id}] 第二个门出现，开始计算 diff")
-                oldest_lost_id = sorted(global_tracks.keys())[0]
-                oldest = global_tracks[oldest_lost_id]
-                sf = oldest.get('start_frame', frame_number)
-                ef = frame_number
-                diff = ef - sf
-                if (diff > 2):
-                    GLOBAL_APPEAR_STEPS.append(diff)
+                print(f"[Track {new_id}] 第{new_id}个门出现，开始计算 diff")
+                if (real_time_diff > 2):
+                    GLOBAL_APPEAR_STEPS.append(real_time_diff)
 
-                print(f"[Track {oldest_lost_id}] 生命周期帧差 = {diff} (start={sf}, end={ef})")
+                print(f"[Track {last_global_id}] 生命周期帧差 = {real_time_diff} (start={sf_for_real_time}, end={ef_for_real_time})")
 
     if len(GLOBAL_APPEAR_STEPS) > 0:
         y_step = GLOBAL_APPEAR_STEPS[-1]
     else:
         y_step = 1
 
-    # 对 global 进行稳定排序并重新赋值对应的 z 分量（top-down 使用 x,z）
     if len(global_tracks) > 1 and len(newly_lost) > 0:
-        last_gid = sorted(global_tracks.keys())[-1]   # 取最后一个 track_id
+        last_gid = sorted(global_tracks.keys())[-1]   
         g = copy.deepcopy(global_tracks[last_gid])
-        g['bbox3D'][2] = (2.5 + y_step / 25.0)  # 用 global_tracks 总数来计算偏移
+        g['bbox3D'][2] = (3.0 + y_step / 20.0)  
         global_tracks[last_gid] = g
 
-        # debug
-        print(f"--------------step::::::{(2.5 + y_step / 25.0)}-------------------")
-
-    # debug
-    # for tracks_id, tracks in sorted(global_tracks.items()):
-    #     x, y, z = tracks['bbox3D'][:3]
-    #     print(f"id {tracks_id} bbox3D: {tracks['bbox3D']}  top=(x,z)=({x:.3f},{z:.3f})")
-
-    return updated_tracks, global_tracks
-
+    return updated_tracks, global_tracks, real_time_diff
+ 
 def get_unique_color(track_id):
     """
     Generates a unique color for each track based on its ID.
@@ -409,6 +408,9 @@ def parse_detections(dets, thres, cats, target_cats):
     return parsed_detections
 
 def build_meshes_for_frame(im_rgb, K, tracks_dict, gobal_tracks_dict, device, augmentations, model, thres, cats, target_cats, max_track_age, frame_number, side="L"):  # side = "L" or "R"
+        
+        real_time_diff = 0
+        
         # 预处理 
         aug_input = T.AugInput(im_rgb)
         _ = augmentations(aug_input)
@@ -441,8 +443,8 @@ def build_meshes_for_frame(im_rgb, K, tracks_dict, gobal_tracks_dict, device, au
         else:
             current_detections = list(tracks_dict.values())
             matches = match_detections(current_detections, detections)
-            new_tracks, new_global_tracks = update_tracks(tracks_dict, gobal_tracks_dict, matches,
-                                                 current_detections, detections, max_track_age, frame_number)
+            new_tracks, new_global_tracks, real_time_diff = update_tracks(tracks_dict, gobal_tracks_dict, matches,
+                                                 current_detections, detections, max_track_age, frame_number, real_time_diff)
             tracks_dict = new_tracks
             gobal_tracks_dict = new_global_tracks
 
@@ -498,18 +500,20 @@ def build_meshes_for_frame(im_rgb, K, tracks_dict, gobal_tracks_dict, device, au
                 box_mesh2 = util.mesh_cuboid(bbox3D2, pose2.tolist(), color=color)
                 meshes2.append(box_mesh2)
 
-                print(f"[{side}] 物体 {cat2} 的位姿: {bbox3D2}")
+                # print(f"[{side}] 物体 {cat2} 的位姿: {bbox3D2}")
 
-        return meshes, meshes_text, meshes2, meshes2_text, gobal_meshes, gobal_meshes_text, tracks_dict, gobal_tracks_dict
+        return meshes, meshes_text, meshes2, meshes2_text, gobal_meshes, gobal_meshes_text, tracks_dict, gobal_tracks_dict, real_time_diff
 
-def translate_meshes(meshes, shift_x, rotate_deg):
+def translate_meshes(meshes, shift_x, shift_y, rotate_deg):
     meshes_shifted = []
     if len(meshes) == 0:
         return meshes_shifted
     angle = math.radians(rotate_deg)
-    R = torch.tensor([[math.cos(-angle), 0, math.sin(-angle)],
-                        [0, 1, 0],
-                        [-math.sin(-angle), 0, math.cos(-angle)]], dtype=torch.float32)
+    R = torch.tensor([
+        [ math.cos(-angle), 0, math.sin(-angle)],
+        [ 0,               1, 0],
+        [-math.sin(-angle), 0, math.cos(-angle)]
+    ], dtype=torch.float32)
     for mesh in meshes:
         device = mesh.device
         verts = mesh.verts_list()[0].clone()
@@ -520,6 +524,7 @@ def translate_meshes(meshes, shift_x, rotate_deg):
         verts = verts @ R.to(device).T
         verts = verts + center
         verts[:, 0] += float(shift_x)
+        verts[:, 1] += float(shift_y)
         new_mesh = Meshes(verts=[verts], faces=[faces], textures=textures)
         meshes_shifted.append(new_mesh)
     return meshes_shifted
@@ -589,15 +594,10 @@ def do_test(args, cfg, model):
     tracks_right  = {}
     gobal_tracks_right    = {}
     max_track_age = 30
+    real_time_diff_l = 0
+    real_time_diff_r = 0
     frame_number = 0
     GLOBAL_NEXT_TRACK_ID = 1
-
-    R_topdown = np.array([
-        [1, 0, 0],
-        [0, 0, 1],
-        [0,-1, 0]
-    ], dtype=np.float32)
-
 
     while True:
         loop_start = getTickCount()
@@ -616,32 +616,31 @@ def do_test(args, cfg, model):
         K = np.array([[f,0,px],[0,f,py],[0,0,1]])
 
         # 左右各自独立检测 + 独立跟踪
-        meshes_l, text_l, meshes2_l, text2_l, gobal_meshes_l, gobal_meshes_text_l, tracks_left, gobal_tracks_left = build_meshes_for_frame(
+        meshes_l, text_l, meshes2_l, text2_l, gobal_meshes_l, gobal_meshes_text_l, tracks_left, gobal_tracks_left, real_time_diff_l = build_meshes_for_frame(
             im_l, K, tracks_left, gobal_tracks_left, device, augmentations, model, thres, cats, target_cats, max_track_age, frame_number, side="L")
-        meshes_r, text_r, meshes2_r, text2_r, gobal_meshes_r, gobal_meshes_text_r, tracks_right, gobal_tracks_right = build_meshes_for_frame(
+        meshes_r, text_r, meshes2_r, text2_r, gobal_meshes_r, gobal_meshes_text_r, tracks_right, gobal_tracks_right, real_time_diff_r = build_meshes_for_frame(
             im_r, K, tracks_right, gobal_tracks_right, device, augmentations, model, thres, cats, target_cats, max_track_age, frame_number, side="R")
         
         # world shift（只平移 tracked boxes，dets 不用移）
-        meshes_l_shift = translate_meshes(meshes_l,  2, rotate_deg=90)
-        meshes_r_shift = translate_meshes(meshes_r, -2, rotate_deg=90)
+        meshes_l_shift = translate_meshes(meshes_l, -2, 0, rotate_deg=-90)
+        meshes_r_shift = translate_meshes(meshes_r, 2, 0, rotate_deg=90)
         combined_shifted = meshes_l_shift + meshes_r_shift
 
-        gobal_meshes_l_shift = translate_meshes(gobal_meshes_l,  2, rotate_deg=90)
-        gobal_meshes_r_shift = translate_meshes(gobal_meshes_r, -2, rotate_deg=90)
-        gobal_combined_shifted = gobal_meshes_l_shift + gobal_meshes_r_shift
+        gobal_meshes_l_shift = translate_meshes(gobal_meshes_l, -2, 3.0 + (real_time_diff_l) / 20, rotate_deg=-90)
+        gobal_meshes_r_shift = translate_meshes(gobal_meshes_r, 2, 3.0 + (real_time_diff_r) / 20, rotate_deg=90)
+        gobal_combined_shifted = gobal_meshes_l_shift + gobal_meshes_r_shift + combined_shifted
+        print(f"[Message] 两门距离：{(real_time_diff_l) / 30}")
 
         # 左摄像头：绘制 left tracked boxes
         im_l_front = im_l.copy()
         if len(meshes2_l) > 0:
-            im_l_det, _, _ = vis.draw_scene_view(im_l, K, meshes2_l, text=text2_l,
-                                                scale=h, blend_weight=0.5, blend_weight_overlay=0.85)
+            im_l_det, _, _ = vis.draw_scene_view(im_l, K, meshes2_l, text=text2_l, scale=h, blend_weight=0.5, blend_weight_overlay=0.85)
             im_l_front = ((im_l_front.astype(np.float32) + im_l_det.astype(np.float32)) / 2).astype(np.uint8)
 
         # 右摄像头：绘制 right tracked boxes
         im_r_front = im_r.copy()
         if len(meshes2_r) > 0:
-            im_r_det, _, _ = vis.draw_scene_view(im_r, K, meshes2_r, text=text2_r,
-                                                scale=h, blend_weight=0.5, blend_weight_overlay=0.85)
+            im_r_det, _, _ = vis.draw_scene_view(im_r, K, meshes2_r, text=text2_r, scale=h, blend_weight=0.5, blend_weight_overlay=0.85)
             im_r_front = ((im_r_front.astype(np.float32) + im_r_det.astype(np.float32)) / 2).astype(np.uint8)
 
         # Top-down
@@ -652,15 +651,11 @@ def do_test(args, cfg, model):
             xs_all = np.concatenate([m.verts_padded()[0].cpu().numpy()[:,0] for m in gobal_combined_shifted])
             ys_all = np.concatenate([m.verts_padded()[0].cpu().numpy()[:,1] for m in gobal_combined_shifted])
             zs_all = np.concatenate([m.verts_padded()[0].cpu().numpy()[:,2] for m in gobal_combined_shifted])
-            pad = 3.0
-            print("xs:", xs_all.min(), xs_all.max())
-            print("zs:", zs_all.min(), zs_all.max())
-            print("ys:", ys_all.min(), ys_all.max())
-
-            ground_bounds = (ys_all.max(), xs_all.min()-pad, xs_all.max()+pad, zs_all.min()-pad, zs_all.max()+pad)
-
+            pad = 10.0
+            ground_level = ys_all.min()
+            ground_bounds = (ground_level, xs_all.min() - pad, xs_all.max() + pad,zs_all.min() - pad, zs_all.max() + pad)
             im_topdown, _ = vis.draw_scene_view(im_l, K, gobal_combined_shifted, text=None,
-                                               scale=h, R=R_topdown, mode='novel',
+                                               scale=h, mode='novel',
                                                ground_bounds=ground_bounds,
                                                blend_weight=0.5, blend_weight_overlay=0.85)
             im_topdown = cv2.resize(im_topdown, (w, h))
@@ -678,6 +673,7 @@ def do_test(args, cfg, model):
             out_writer.write(final_concat)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
+        print(f"处理完第 {frame_number} 帧")
 
         frame_number += 1
 
